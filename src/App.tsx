@@ -11,6 +11,7 @@
 import React, { useState, useEffect } from 'react';
 import WellnessApp from './WellnessApp';
 import SmartAccountingApp from './SmartAccountingApp';
+import { LegalContractsModal, LegalContractTab } from './components/LegalContractsModal';
 import { 
   ArrowRight, 
   Sparkles, 
@@ -41,6 +42,14 @@ export default function App() {
       return 'welcome';
     }
   });
+
+  const [isLegalModalOpen, setIsLegalModalOpen] = useState(false);
+  const [legalContractTab, setLegalContractTab] = useState<LegalContractTab>('preInfo');
+
+  const openLegalContract = (tab: LegalContractTab) => {
+    setLegalContractTab(tab);
+    setIsLegalModalOpen(true);
+  };
 
   const [isDarkMode, setIsDarkMode] = useState<boolean>(() => {
     try {
@@ -179,10 +188,39 @@ export default function App() {
           </div>
         </main>
 
-        {/* Footer */}
-        <footer className="w-full py-5 text-center text-xs text-slate-400 dark:text-slate-600 border-t border-slate-200/40 dark:border-slate-800/40">
-          <span>AKN Global Group Ltd. © {new Date().getFullYear()} · Tüm hakları saklıdır.</span>
+        <footer className="w-full border-t border-slate-200/60 dark:border-slate-800/60 px-6 py-8">
+          <div className="mx-auto max-w-5xl space-y-5">
+            <section aria-labelledby="welcome-legal-title" className="space-y-3">
+              <h2 id="welcome-legal-title" className="text-sm font-bold text-slate-700 dark:text-slate-200">
+                Sanal POS ve banka incelemesi için sözleşmeler ve bilgilendirmeler
+              </h2>
+              <nav aria-label="Yasal sözleşmeler" className="flex flex-wrap gap-x-5 gap-y-2 text-xs">
+                <button onClick={() => openLegalContract('preInfo')} className="text-blue-700 underline underline-offset-2 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-200">Ön Bilgilendirme Formu</button>
+                <button onClick={() => openLegalContract('distanceSale')} className="text-blue-700 underline underline-offset-2 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-200">Mesafeli Satış Sözleşmesi</button>
+                <button onClick={() => openLegalContract('cancellationRefund')} className="text-blue-700 underline underline-offset-2 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-200">İptal, İade ve Cayma Koşulları</button>
+                <button onClick={() => openLegalContract('terms')} className="text-blue-700 underline underline-offset-2 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-200">Kullanıcı ve Lisans Sözleşmesi</button>
+                <button onClick={() => openLegalContract('mlmTerms')} className="text-blue-700 underline underline-offset-2 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-200">MLM / Bayilik Şartları</button>
+                <button onClick={() => openLegalContract('kvkk')} className="text-blue-700 underline underline-offset-2 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-200">KVKK ve Gizlilik</button>
+              </nav>
+            </section>
+
+            <section aria-labelledby="welcome-health-notice" className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">
+              <h2 id="welcome-health-notice" className="text-xs font-bold">Önemli sağlık bilgilendirmesi</h2>
+              <p className="mt-1 text-xs leading-relaxed">
+                AKN Wellness uygulaması sağlık hizmeti, tıbbi cihaz veya tedavi yöntemi değildir; içerikleri tıbbi teşhis, tedavi ya da reçete yerine geçmez ve hastalıkları tedavi etme amacı taşımaz. Sağlık sorularınız için yetkili bir sağlık profesyoneline başvurun.
+              </p>
+            </section>
+
+            <p className="text-center text-xs text-slate-400 dark:text-slate-600">
+              AKN Global Group Ltd. © {new Date().getFullYear()} · Tüm hakları saklıdır.
+            </p>
+          </div>
         </footer>
+        <LegalContractsModal
+          isOpen={isLegalModalOpen}
+          onClose={() => setIsLegalModalOpen(false)}
+          initialTab={legalContractTab}
+        />
       </div>
     );
   }

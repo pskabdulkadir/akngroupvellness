@@ -1,7 +1,7 @@
 import express from 'express';
 import 'dotenv/config';
 import path from 'path';
-import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from 'crypto';
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from 'crypto';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { getPostgresPool, runDatabaseMigrations, withTransaction } from './src/db/postgres';
@@ -78,6 +78,26 @@ const MONOLINE_DEPTH_PERCENTAGES = [7, 5, 4, 3, 2, 2, 2];
 
 function roundCurrency(val: number): number {
   return Math.round((val + Number.EPSILON) * 100) / 100;
+}
+
+function accountingPiiKey(): Buffer | null {
+  const value = process.env.ACCOUNTING_PII_ENCRYPTION_KEY?.trim() || '';
+  return /^[a-fA-F0-9]{64}$/.test(value) ? Buffer.from(value, 'hex') : null;
+}
+
+function encryptAccountingPii(value: unknown, key: Buffer): Buffer {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(value), 'utf8'), cipher.final()]);
+  return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]);
+}
+
+function decryptAccountingPii(value: Buffer, key: Buffer): any {
+  const iv = value.subarray(0, 12);
+  const authTag = value.subarray(12, 28);
+  const decipher = createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(authTag);
+  return JSON.parse(Buffer.concat([decipher.update(value.subarray(28)), decipher.final()]).toString('utf8'));
 }
 
 function getPackageOrderAmount(userId: string, packageId: Exclude<PackageId, 'CUSTOM'>): number {
@@ -2063,6 +2083,101 @@ function processOrderCommission(payload: OrderCommissionPayload): CommissionTran
   });
 
   return tx;
+}
+
+async function persistVerifiedOrderAccounting(
+  payload: OrderCommissionPayload,
+  transaction: CommissionTransaction
+): Promise<void> {
+  const buyer = members.find((member) => member.user_id === transaction.buyer_user_id);
+  if (!buyer) throw new Error('Muhasebe kaydı için sipariş sahibi bulunamadı.');
+
+  const currency = resolveMemberRegion(buyer.country_code) === 'INTERNATIONAL' ? 'USD' : 'TRY';
+  const orderAmount = roundCurrency(Number(payload.order_amount));
+  const commissionRows = commissionLogs.filter(
+    (log) => log.order_id === transaction.order_id && log.target_user_id !== null && log.target_external_id !== 'SYSTEM_POOL'
+  );
+
+  await withTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO orders (order_id, user_id, order_type, package_id, order_amount, currency, payment_status, payment_method, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'PAID', $7, $8)
+       ON CONFLICT (order_id) DO NOTHING`,
+      [
+        transaction.order_id,
+        buyer.user_id,
+        transaction.order_type || 'STANDARD_ORDER',
+        String(payload.package_id || ''),
+        orderAmount,
+        currency,
+        String(payload.payment_method || 'CARD_3D'),
+        transaction.created_at,
+      ]
+    );
+
+    for (const log of commissionRows) {
+      const beneficiaryId = String(log.target_external_id);
+      const commissionId = createHash('sha256')
+        .update(`${transaction.order_id}:${log.commission_type}:${log.depth_level || 0}:${beneficiaryId}`)
+        .digest('hex');
+      const amount = roundCurrency(Number(log.amount));
+      if (amount <= 0) continue;
+
+      const inserted = await client.query(
+        `INSERT INTO commission_logs (
+           commission_id, order_id, beneficiary_user_id, commission_type, tier_level,
+           amount, currency, status, release_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (commission_id) DO NOTHING
+         RETURNING commission_id`,
+        [commissionId, transaction.order_id, beneficiaryId, log.commission_type, log.depth_level, amount, currency, log.status, log.release_at]
+      );
+      if (!inserted.rowCount) continue;
+
+      if (log.status === 'PENDING_14D') {
+        const pendingColumn = currency === 'TRY' ? 'pending_try' : 'pending_usd';
+        await client.query(`UPDATE members SET ${pendingColumn} = ${pendingColumn} + $1 WHERE user_id = $2`, [amount, beneficiaryId]);
+      } else if (log.status === 'RELEASED') {
+        const walletColumn = currency === 'TRY' ? 'wallet_try' : 'wallet_usd';
+        await client.query(`UPDATE members SET ${walletColumn} = ${walletColumn} + $1 WHERE user_id = $2`, [amount, beneficiaryId]);
+      }
+
+      await client.query(
+        `INSERT INTO wallet_transactions (
+           transaction_id, order_id, transaction_type, user_id, amount, currency,
+           direction, description, reference_event_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'CREDIT', $7, $8)
+         ON CONFLICT DO NOTHING`,
+        [
+          `COM-${commissionId}`,
+          transaction.order_id,
+          `COMMISSION_${log.status}`,
+          beneficiaryId,
+          amount,
+          currency,
+          `${log.commission_type} komisyon hakedişi`,
+          commissionId,
+        ]
+      );
+
+      if (log.status === 'PENDING_14D' || log.status === 'RELEASED') {
+        const accrualKey = createHash('sha256').update(`COMMISSION_ACCRUAL:${commissionId}`).digest('hex');
+        await client.query(
+          `INSERT INTO journal_entries (
+             voucher_number, source_event_type, source_event_id, currency,
+             debit_account_code, debit_account_name, debit_amount,
+             credit_account_code, credit_account_name, credit_amount,
+             description, idempotency_key
+           ) VALUES ($1, 'COMMISSION_ACCRUAL', $2, $3,
+                    '760.01', 'Bayi Komisyon Giderleri', $4,
+                    '381.01', 'Bekleyen Komisyon Tahakkukları', $4,
+                    $5, $6)
+           ON CONFLICT DO NOTHING`,
+          [`YEV-${accrualKey.slice(0, 32)}`, commissionId, currency, amount, `${log.commission_type} brüt hakediş tahakkuku`, accrualKey]
+        );
+      }
+    }
+  });
 }
 
 function resetToCleanSlate(includeAdmin = true) {
@@ -5462,19 +5577,21 @@ async function startServer() {
       });
 
       // 3. Kuyruğa İş Emri Ekle (Arka Planda Güvenli İşlenecek)
+      const commissionPayload: OrderCommissionPayload = {
+        user_id: String(user_id),
+        order_id: normalizedOrderId,
+        order_amount: Number(order_amount),
+        package_id: String(package_id || 'PKG_MINI_DENEME'),
+        timestamp: orderCreatedAt,
+        order_type: order_type || 'STANDARD_ORDER',
+        payment_method,
+      };
       const transaction = await commissionQueue.add(
         'process-commission',
-        {
-          user_id: String(user_id),
-          order_id: normalizedOrderId,
-          order_amount: Number(order_amount),
-          package_id: String(package_id || 'PKG_MINI_DENEME'),
-          timestamp: orderCreatedAt,
-          order_type: order_type || 'STANDARD_ORDER',
-          payment_method,
-        },
+        commissionPayload,
         { attempts: 3, backoff: 5000 }
       );
+      await persistVerifiedOrderAccounting(commissionPayload, transaction);
 
       return res.status(200).json({
         success: true,
@@ -7106,17 +7223,99 @@ async function startServer() {
     return { releasedLogsCount, releasedTotalAmount };
   }
 
-  function releaseMaturedCommissions(options?: { order_id?: string }) {
-    return releasePendingCommissionsCron(options);
+  async function releaseMaturedCommissions(options?: { order_id?: string }) {
+    const released = await withTransaction(async (client) => {
+      const result = await client.query(
+        `SELECT c.commission_id, c.order_id, c.beneficiary_user_id, c.amount, c.currency, c.release_at
+         FROM commission_logs c
+         JOIN orders o ON o.order_id = c.order_id
+         WHERE c.status = 'PENDING_14D'
+           AND c.clawback_status = 'ACTIVE'
+           AND c.release_at <= NOW()
+           AND o.payment_status IN ('PAID', 'CONFIRMED', 'COMPLETED')
+           AND ($1::varchar IS NULL OR c.order_id = $1)
+         ORDER BY c.release_at, c.commission_id
+         FOR UPDATE OF c SKIP LOCKED
+         LIMIT 500`,
+        [options?.order_id || null]
+      );
+
+      for (const commission of result.rows) {
+        const currency = String(commission.currency).toUpperCase();
+        if (currency !== 'TRY' && currency !== 'USD') continue;
+        const pendingColumn = currency === 'TRY' ? 'pending_try' : 'pending_usd';
+        const walletColumn = currency === 'TRY' ? 'wallet_try' : 'wallet_usd';
+        const amount = Number(commission.amount);
+        const walletUpdated = await client.query(
+          `UPDATE members SET ${pendingColumn} = ${pendingColumn} - $1,
+             ${walletColumn} = ${walletColumn} + $1, updated_at = NOW()
+           WHERE user_id = $2 AND ${pendingColumn} >= $1`,
+          [amount, commission.beneficiary_user_id]
+        );
+        if (!walletUpdated.rowCount) throw new Error(`Hakediş cüzdan bakiyesi güncellenemedi: ${commission.commission_id}`);
+
+        await client.query(
+          `UPDATE commission_logs SET status = 'RELEASED', clawback_status = 'RELEASED_TO_BALANCE'
+           WHERE commission_id = $1`,
+          [commission.commission_id]
+        );
+        await client.query(
+          `INSERT INTO wallet_transactions (
+             transaction_id, order_id, transaction_type, user_id, amount, currency,
+             direction, description, reference_event_id
+           ) VALUES ($1, NULL, 'COMMISSION_RELEASED', $2, $3, $4, 'CREDIT', $5, $6)
+           ON CONFLICT DO NOTHING`,
+          [
+            `REL-${commission.commission_id}`,
+            commission.beneficiary_user_id,
+            amount,
+            currency,
+            '14 günlük bekleme süresi tamamlanan komisyon',
+            commission.commission_id,
+          ]
+        );
+        const releaseKey = createHash('sha256').update(`COMMISSION_RELEASE:${commission.commission_id}`).digest('hex');
+        await client.query(
+          `INSERT INTO journal_entries (
+             voucher_number, source_event_type, source_event_id, currency,
+             debit_account_code, debit_account_name, debit_amount,
+             credit_account_code, credit_account_name, credit_amount,
+             description, idempotency_key
+           ) VALUES ($1, 'COMMISSION_14D_RELEASED', $2, $3,
+                    '381.01', 'Bekleyen Komisyon Tahakkukları', $4,
+                    '320.01', 'Bayi Cari Hakediş Hesabı', $4, $5, $6)
+           ON CONFLICT DO NOTHING`,
+          [
+            `YEV-${releaseKey.slice(0, 32)}`,
+            commission.commission_id,
+            currency,
+            amount,
+            '14 günlük süre sonunda komisyon serbest bırakma',
+            releaseKey,
+          ]
+        );
+        const jobKey = createHash('sha256').update(`CREATE_ACCOUNTING_DRAFT:${commission.commission_id}`).digest('hex');
+        await client.query(
+          `INSERT INTO accounting_jobs (job_type, source_event_id, idempotency_key, run_after)
+           VALUES ('CREATE_ACCOUNTING_DRAFT', $1, $2, NOW())
+           ON CONFLICT (idempotency_key) DO NOTHING`,
+          [commission.commission_id, jobKey]
+        );
+      }
+      return result.rows;
+    });
+
+    for (const orderId of new Set(released.map((row) => String(row.order_id)))) {
+      releasePendingCommissionsCron({ order_id: orderId });
+    }
+    return { releasedLogsCount: released.length, releasedTotalAmount: roundCurrency(released.reduce((sum, row) => sum + Number(row.amount), 0)) };
   }
 
   // V2.0: 14 Günlük Cayma & İade Koruması (Clawback Protection) — Bekleyen Komisyonları Çekilebilir Bakiyeye Aktarma Cron Job
   app.post('/api/v1/admin/cron/release-clawback', requireAdminJwt, async (req, res) => {
     try {
       const { order_id } = req.body || {};
-      const result = await runInAtomicTransaction(() =>
-        releasePendingCommissionsCron({ order_id })
-      );
+      const result = await releaseMaturedCommissions({ order_id });
 
       res.json({
         status: 'success',
@@ -9626,6 +9825,56 @@ async function startServer() {
     });
   });
 
+  app.put('/api/v1/member/accounting-profile', requireWithdrawalMember, async (req, res) => {
+    const encryptionKey = accountingPiiKey();
+    if (!encryptionKey) {
+      return res.status(503).json({ error: 'ACCOUNTING_PII_ENCRYPTION_KEY yapılandırılmamış.' });
+    }
+    const userId = String(req.body?.user_id || '').trim();
+    const taxId = String(req.body?.tax_id || '').replace(/\s/g, '');
+    const address = String(req.body?.address || '').trim();
+    const iban = normalizeIban(String(req.body?.iban || ''));
+    const ibanHolder = String(req.body?.iban_holder || '').trim();
+    const isCompany = req.body?.is_company === true;
+    const bankName = String(req.body?.bank_name || '').trim().slice(0, 128);
+    const validTaxId = isCompany ? /^\d{10}$/.test(taxId) : /^\d{11}$/.test(taxId);
+    const ibanError = validateWithdrawalPayout({ region: 'DOMESTIC', channel: 'TR_IBAN', iban });
+    if (!validTaxId || address.length < 10 || ibanError || ibanHolder.length < 3) {
+      return res.status(400).json({ error: 'Vergi kimlik bilgisi, açık adres, IBAN veya hesap sahibi bilgisi geçersiz.' });
+    }
+
+    try {
+      await getPostgresPool().query(
+        `INSERT INTO member_payout_profiles (
+           beneficiary_user_id, tax_id_ciphertext, tax_office_ciphertext,
+           address_ciphertext, iban_ciphertext, iban_holder_ciphertext, bank_name, is_company
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (beneficiary_user_id) DO UPDATE SET
+           tax_id_ciphertext = EXCLUDED.tax_id_ciphertext,
+           tax_office_ciphertext = EXCLUDED.tax_office_ciphertext,
+           address_ciphertext = EXCLUDED.address_ciphertext,
+           iban_ciphertext = EXCLUDED.iban_ciphertext,
+           iban_holder_ciphertext = EXCLUDED.iban_holder_ciphertext,
+           bank_name = EXCLUDED.bank_name,
+           is_company = EXCLUDED.is_company,
+           updated_at = NOW()`,
+        [
+          userId,
+          encryptAccountingPii(taxId, encryptionKey),
+          req.body?.tax_office ? encryptAccountingPii(String(req.body.tax_office).slice(0, 128), encryptionKey) : null,
+          encryptAccountingPii(address, encryptionKey),
+          encryptAccountingPii(iban, encryptionKey),
+          encryptAccountingPii(ibanHolder, encryptionKey),
+          bankName || null,
+          isCompany,
+        ]
+      );
+      return res.json({ success: true, message: 'Muhasebe ve ödeme profili şifreli olarak kaydedildi.' });
+    } catch {
+      return res.status(503).json({ error: 'Muhasebe profili kaydedilemedi.' });
+    }
+  });
+
   // 5. Muhasebe Entegrasyonu Sağlık & Canlı Durum Kontrolü
   app.get('/api/v1/integrations/accounting/health', requireAdminJwt, async (_req, res) => {
     try {
@@ -9833,7 +10082,7 @@ async function startServer() {
   app.get('/api/v1/integrations/accounting/sync-data', requireAdminJwt, async (_req, res) => {
     try {
       const pool = getPostgresPool();
-      const [membersResult, ordersResult, transactionsResult, commissionsResult, withdrawalsResult, ledgerResult] = await Promise.all([
+      const [membersResult, ordersResult, transactionsResult, commissionsResult, withdrawalsResult, ledgerResult, invoicesResult, jobsResult, batchesResult, anomaliesResult] = await Promise.all([
         pool.query(`
           WITH RECURSIVE descendants(root_user_id, descendant_user_id, path) AS (
             SELECT user_id, user_id, ARRAY[user_id]
@@ -9930,6 +10179,26 @@ async function startServer() {
                  credit_account_name, credit_amount, description, reconciled, created_at
           FROM journal_entries ORDER BY created_at DESC
         `),
+        pool.query(`
+          SELECT invoice_id, source_event_id, commission_id, beneficiary_user_id, document_type, status,
+                 currency, gross_amount, withholding_amount, stamp_tax_amount, net_amount,
+                 tax_rule_id, provider, provider_document_id, pdf_storage_key, xml_storage_key,
+                 output_sha256, last_error, created_at, updated_at
+          FROM accounting_invoices ORDER BY created_at DESC
+        `),
+        pool.query(`
+          SELECT id, job_type, source_event_id, run_after, status, attempts, last_error, created_at, completed_at
+          FROM accounting_jobs ORDER BY created_at DESC LIMIT 500
+        `),
+        pool.query(`
+          SELECT batch_id, currency, status, gross_total, withholding_total, stamp_tax_total, net_total,
+                 created_by, approved_by, approved_at, settled_by, settled_at, settlement_reference, created_at
+          FROM payout_batches ORDER BY created_at DESC LIMIT 500
+        `),
+        pool.query(`
+          SELECT id, source_event_id, anomaly_type, severity, message, resolved_at, resolved_by, created_at
+          FROM accounting_anomalies ORDER BY created_at DESC LIMIT 500
+        `),
       ]);
 
       res.json({
@@ -9941,12 +10210,545 @@ async function startServer() {
         commissions: commissionsResult.rows,
         withdrawal_requests: withdrawalsResult.rows,
         ledger_entries: ledgerResult.rows,
+        accounting_invoices: invoicesResult.rows,
+        accounting_jobs: jobsResult.rows,
+        payout_batches: batchesResult.rows,
+        accounting_anomalies: anomaliesResult.rows,
         timestamp: new Date().toISOString(),
       });
     } catch {
       res.status(503).json({ status: 'error', message: 'PostgreSQL muhasebe kayıtları okunamadı.' });
     }
   });
+
+  app.get('/api/v1/integrations/accounting/payout-eligible', requireAdminJwt, async (_req, res) => {
+    try {
+      const key = accountingPiiKey();
+      if (!key) return res.status(503).json({ error: 'Ödeme profili şifreleme anahtarı yapılandırılmamış.' });
+      const result = await getPostgresPool().query(
+        `SELECT c.commission_id, c.beneficiary_user_id, m.full_name, m.wallet_try,
+                COALESCE(reserved.amount, 0) AS reserved_amount,
+                i.invoice_id, i.currency, i.gross_amount, i.withholding_amount, i.stamp_tax_amount, i.net_amount,
+                p.iban_ciphertext, p.iban_holder_ciphertext, p.bank_name
+         FROM commission_logs c
+         JOIN orders o ON o.order_id = c.order_id AND o.payment_status IN ('PAID', 'CONFIRMED', 'COMPLETED')
+         JOIN members m ON m.user_id = c.beneficiary_user_id
+         JOIN accounting_invoices i ON i.commission_id = c.commission_id AND i.status = 'ISSUED'
+         JOIN member_payout_profiles p ON p.beneficiary_user_id = c.beneficiary_user_id
+         LEFT JOIN payout_batch_items bi ON bi.commission_id = c.commission_id AND bi.status <> 'REJECTED'
+         LEFT JOIN LATERAL (
+           SELECT SUM(bi2.gross_amount) AS amount FROM payout_batch_items bi2
+           JOIN payout_batches b2 ON b2.batch_id = bi2.batch_id
+           WHERE bi2.beneficiary_user_id = c.beneficiary_user_id
+             AND b2.status IN ('DRAFT', 'APPROVED', 'PAYOUT_PENDING')
+         ) reserved ON TRUE
+         WHERE c.status = 'RELEASED' AND c.clawback_status = 'RELEASED_TO_BALANCE'
+           AND c.release_at <= NOW() AND c.currency = 'TRY'
+           AND bi.commission_id IS NULL AND m.wallet_try - COALESCE(reserved.amount, 0) >= i.gross_amount
+         ORDER BY c.release_at, c.commission_id`
+      );
+      return res.json({
+        payouts: result.rows.map((row) => ({
+          commission_id: row.commission_id,
+          beneficiary_user_id: row.beneficiary_user_id,
+          beneficiary_name: row.full_name,
+          iban: decryptAccountingPii(row.iban_ciphertext, key),
+          iban_holder: decryptAccountingPii(row.iban_holder_ciphertext, key),
+          bank_name: row.bank_name,
+          invoice_id: row.invoice_id,
+          currency: row.currency,
+          gross_amount: Number(row.gross_amount),
+          withholding_amount: Number(row.withholding_amount),
+          stamp_tax_amount: Number(row.stamp_tax_amount),
+          net_amount: Number(row.net_amount),
+          wallet_balance: Number(row.wallet_try) - Number(row.reserved_amount),
+        })),
+      });
+    } catch {
+      return res.status(503).json({ error: 'Ödemeye uygun komisyon listesi okunamadı.' });
+    }
+  });
+
+  app.get('/api/v1/integrations/accounting/payout-batches', requireAdminJwt, async (_req, res) => {
+    try {
+      const result = await getPostgresPool().query(
+        `SELECT b.batch_id, b.status, b.currency, b.gross_total, b.withholding_total, b.stamp_tax_total,
+                b.net_total, b.created_by, b.approved_by, b.approved_at, b.settled_by, b.settled_at,
+                b.settlement_reference, b.created_at, COUNT(bi.id)::int AS item_count
+         FROM payout_batches b LEFT JOIN payout_batch_items bi ON bi.batch_id = b.batch_id
+         GROUP BY b.id ORDER BY b.created_at DESC LIMIT 100`
+      );
+      return res.json({ batches: result.rows });
+    } catch {
+      return res.status(503).json({ error: 'Toplu ödeme geçmişi okunamadı.' });
+    }
+  });
+
+  app.post('/api/v1/integrations/accounting/payout-batches', requireAdminJwt, async (req, res) => {
+    const commissionIds = Array.isArray(req.body?.commission_ids)
+      ? [...new Set(req.body.commission_ids.map((id: unknown) => String(id).trim()).filter(Boolean))]
+      : [];
+    const idempotencyKey = String(req.body?.idempotency_key || '').trim();
+    if (!commissionIds.length || commissionIds.length > 200 || !idempotencyKey || idempotencyKey.length > 128) {
+      return res.status(400).json({ error: '1–200 arası komisyon ve idempotency_key gereklidir.' });
+    }
+
+    try {
+      const result = await withTransaction(async (client) => {
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [idempotencyKey, 'accounting-payout-batch']);
+        const existing = await client.query(
+          'SELECT batch_id, status FROM payout_batches WHERE idempotency_key = $1',
+          [idempotencyKey]
+        );
+        if (existing.rowCount) {
+          const previousItems = await client.query(
+            'SELECT commission_id FROM payout_batch_items WHERE batch_id = $1 ORDER BY commission_id',
+            [existing.rows[0].batch_id]
+          );
+          const previousIds = previousItems.rows.map((row) => String(row.commission_id)).sort();
+          if (previousIds.length !== commissionIds.length || previousIds.some((id, index) => id !== [...commissionIds].sort()[index])) {
+            throw new Error('Aynı idempotency_key farklı komisyon seçimiyle kullanılamaz.');
+          }
+          return { existing: true, batch: existing.rows[0] };
+        }
+
+        const selected = await client.query(
+          `SELECT c.commission_id, c.beneficiary_user_id, c.currency,
+                  i.invoice_id, i.gross_amount, i.withholding_amount, i.stamp_tax_amount, i.net_amount,
+                  m.wallet_try
+           FROM commission_logs c
+           JOIN orders o ON o.order_id = c.order_id AND o.payment_status IN ('PAID', 'CONFIRMED', 'COMPLETED')
+           JOIN members m ON m.user_id = c.beneficiary_user_id
+           JOIN member_payout_profiles p ON p.beneficiary_user_id = c.beneficiary_user_id
+           JOIN accounting_invoices i ON i.commission_id = c.commission_id AND i.status = 'ISSUED'
+           LEFT JOIN payout_batch_items bi ON bi.commission_id = c.commission_id AND bi.status <> 'REJECTED'
+           WHERE c.commission_id = ANY($1::varchar[]) AND c.status = 'RELEASED'
+             AND c.clawback_status = 'RELEASED_TO_BALANCE'
+             AND c.release_at <= NOW() AND c.currency = 'TRY' AND bi.commission_id IS NULL
+           ORDER BY c.commission_id FOR UPDATE OF c, m`,
+          [commissionIds]
+        );
+        if (selected.rowCount !== commissionIds.length) {
+          throw new Error('Seçim içinde yayımlanmış pusulası olmayan, uygun olmayan veya başka batch’e eklenmiş komisyon var.');
+        }
+        const requiredByBeneficiary = new Map<string, { required: number; balance: number }>();
+        for (const row of selected.rows) {
+          const current = requiredByBeneficiary.get(row.beneficiary_user_id) || { required: 0, balance: Number(row.wallet_try) };
+          current.required = roundCurrency(current.required + Number(row.gross_amount));
+          requiredByBeneficiary.set(row.beneficiary_user_id, current);
+        }
+        for (const [beneficiaryId, amounts] of requiredByBeneficiary) {
+          const reserved = await client.query(
+            `SELECT COALESCE(SUM(bi.gross_amount), 0) AS amount
+             FROM payout_batch_items bi JOIN payout_batches b ON b.batch_id = bi.batch_id
+             WHERE bi.beneficiary_user_id = $1 AND b.status IN ('DRAFT', 'APPROVED', 'PAYOUT_PENDING')`,
+            [beneficiaryId]
+          );
+          if (amounts.balance - Number(reserved.rows[0].amount) < amounts.required) {
+            throw new Error(`Bayi cüzdan bakiyesi mevcut rezervler sonrası yetersiz: ${beneficiaryId}`);
+          }
+        }
+
+        const totals = selected.rows.reduce((sum, row) => ({
+          gross: roundCurrency(sum.gross + Number(row.gross_amount)),
+          withholding: roundCurrency(sum.withholding + Number(row.withholding_amount)),
+          stamp: roundCurrency(sum.stamp + Number(row.stamp_tax_amount)),
+          net: roundCurrency(sum.net + Number(row.net_amount)),
+        }), { gross: 0, withholding: 0, stamp: 0, net: 0 });
+        const batchId = `PB-${randomBytes(16).toString('hex')}`;
+        await client.query(
+          `INSERT INTO payout_batches (
+             batch_id, idempotency_key, currency, status, gross_total, withholding_total,
+             stamp_tax_total, net_total, created_by
+           ) VALUES ($1, $2, 'TRY', 'DRAFT', $3, $4, $5, $6, $7)`,
+          [batchId, idempotencyKey, totals.gross, totals.withholding, totals.stamp, totals.net, res.locals.adminUid]
+        );
+        for (const row of selected.rows) {
+          const itemKey = createHash('sha256').update(`PAYOUT:${batchId}:${row.commission_id}`).digest('hex');
+          await client.query(
+            `INSERT INTO payout_batch_items (
+               batch_id, commission_id, beneficiary_user_id, currency, gross_amount,
+               withholding_amount, stamp_tax_amount, net_amount, idempotency_key
+             ) VALUES ($1, $2, $3, 'TRY', $4, $5, $6, $7, $8)`,
+            [batchId, row.commission_id, row.beneficiary_user_id, row.gross_amount, row.withholding_amount, row.stamp_tax_amount, row.net_amount, itemKey]
+          );
+        }
+        return { existing: false, batch: { batch_id: batchId, status: 'DRAFT', ...totals } };
+      });
+      return res.status(result.existing ? 200 : 201).json({ success: true, ...result });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Toplu ödeme taslağı oluşturulamadı.';
+      return res.status(409).json({ error: message });
+    }
+  });
+
+  app.get('/api/v1/integrations/accounting/payout-batches/:batchId', requireAdminJwt, async (req, res) => {
+    try {
+      const key = accountingPiiKey();
+      if (!key) return res.status(503).json({ error: 'Ödeme profili şifreleme anahtarı yapılandırılmamış.' });
+      const pool = getPostgresPool();
+      const batchResult = await pool.query(
+        `SELECT batch_id, status, currency, gross_total, withholding_total, stamp_tax_total, net_total,
+                created_by, approved_by, approved_at, settlement_reference, created_at
+         FROM payout_batches WHERE batch_id = $1`,
+        [req.params.batchId]
+      );
+      if (!batchResult.rowCount) return res.status(404).json({ error: 'Toplu ödeme kaydı bulunamadı.' });
+      if (!['DRAFT', 'APPROVED', 'SETTLED'].includes(batchResult.rows[0].status) ||
+          (batchResult.rows[0].status === 'DRAFT' && batchResult.rows[0].created_by !== res.locals.adminUid)) {
+        return res.status(403).json({ error: 'Taslak banka dosyasına yalnızca oluşturan yönetici erişebilir.' });
+      }
+      const items = await pool.query(
+        `SELECT bi.commission_id, bi.beneficiary_user_id, m.full_name AS beneficiary_name, p.iban_ciphertext,
+                p.iban_holder_ciphertext, p.bank_name, bi.currency, bi.gross_amount, bi.withholding_amount,
+                bi.stamp_tax_amount, bi.net_amount, bi.status, i.invoice_id
+         FROM payout_batch_items bi
+         JOIN members m ON m.user_id = bi.beneficiary_user_id
+         JOIN member_payout_profiles p ON p.beneficiary_user_id = bi.beneficiary_user_id
+         JOIN accounting_invoices i ON i.commission_id = bi.commission_id
+         WHERE bi.batch_id = $1 ORDER BY bi.id`,
+        [req.params.batchId]
+      );
+      return res.json({
+        batch: batchResult.rows[0],
+        items: items.rows.map((row) => ({
+          ...row,
+          iban: decryptAccountingPii(row.iban_ciphertext, key),
+          iban_holder: decryptAccountingPii(row.iban_holder_ciphertext, key),
+          gross_amount: Number(row.gross_amount),
+          withholding_amount: Number(row.withholding_amount),
+          stamp_tax_amount: Number(row.stamp_tax_amount),
+          net_amount: Number(row.net_amount),
+          iban_ciphertext: undefined,
+          iban_holder_ciphertext: undefined,
+        })),
+      });
+    } catch {
+      return res.status(503).json({ error: 'Toplu ödeme detayları okunamadı.' });
+    }
+  });
+
+  app.post('/api/v1/integrations/accounting/payout-batches/:batchId/cancel', requireAdminJwt, async (req, res) => {
+    try {
+      const result = await withTransaction(async (client) => {
+        const batch = await client.query(
+          'SELECT batch_id, status, created_by FROM payout_batches WHERE batch_id = $1 FOR UPDATE',
+          [req.params.batchId]
+        );
+        if (!batch.rowCount) return { error: 'Toplu ödeme kaydı bulunamadı.', statusCode: 404 };
+        if (batch.rows[0].status !== 'DRAFT' || batch.rows[0].created_by !== res.locals.adminUid) {
+          return { error: 'Yalnızca oluşturan yönetici kendi taslağını iptal edebilir.', statusCode: 409 };
+        }
+        await client.query(`UPDATE payout_batch_items SET status = 'REJECTED' WHERE batch_id = $1 AND status = 'QUEUED'`, [req.params.batchId]);
+        await client.query(`UPDATE payout_batches SET status = 'REJECTED' WHERE batch_id = $1`, [req.params.batchId]);
+        return { success: true, status: 'REJECTED' };
+      });
+      if ('error' in result) return res.status(result.statusCode).json({ error: result.error });
+      return res.json(result);
+    } catch {
+      return res.status(503).json({ error: 'Ödeme taslağı iptal edilemedi.' });
+    }
+  });
+
+  app.post('/api/v1/integrations/accounting/payout-batches/:batchId/approve', requireAdminJwt, async (req, res) => {
+    try {
+      const result = await withTransaction(async (client) => {
+        const batch = await client.query(
+          `SELECT batch_id, status, created_by FROM payout_batches WHERE batch_id = $1 FOR UPDATE`,
+          [req.params.batchId]
+        );
+        if (!batch.rowCount) return { error: 'Toplu ödeme kaydı bulunamadı.', statusCode: 404 };
+        if (batch.rows[0].status !== 'DRAFT') return { error: 'Yalnızca taslak toplu ödeme onaylanabilir.', statusCode: 409 };
+        if (batch.rows[0].created_by === res.locals.adminUid) return { error: 'Taslağı oluşturan yönetici kendi toplu ödemesini onaylayamaz.', statusCode: 403 };
+        const validItems = await client.query(
+          `SELECT COUNT(*)::int AS count FROM payout_batch_items bi
+           JOIN accounting_invoices i ON i.commission_id = bi.commission_id AND i.status = 'ISSUED'
+           JOIN commission_logs c ON c.commission_id = bi.commission_id AND c.status = 'RELEASED'
+           WHERE bi.batch_id = $1`,
+          [req.params.batchId]
+        );
+        const itemCount = await client.query('SELECT COUNT(*)::int AS count FROM payout_batch_items WHERE batch_id = $1', [req.params.batchId]);
+        if (!Number(itemCount.rows[0].count) || Number(validItems.rows[0].count) !== Number(itemCount.rows[0].count)) {
+          return { error: 'Tüm kalemlerin gider pusulası yayımlanmış ve hakedişi serbest bırakılmış olmalı.', statusCode: 409 };
+        }
+        await client.query(
+          `UPDATE payout_batches SET status = 'APPROVED', approved_by = $2, approved_at = NOW()
+           WHERE batch_id = $1`,
+          [req.params.batchId, res.locals.adminUid]
+        );
+        return { success: true, status: 'APPROVED' };
+      });
+      if ('error' in result) return res.status(result.statusCode).json({ error: result.error });
+      return res.json(result);
+    } catch {
+      return res.status(503).json({ error: 'Toplu ödeme onaylanamadı.' });
+    }
+  });
+
+  app.post('/api/v1/integrations/accounting/payout-batches/:batchId/complete', requireAdminJwt, async (req, res) => {
+    const bankReference = String(req.body?.bank_reference || '').trim();
+    if (req.body?.bank_transfer_completed !== true || bankReference.length < 5 || bankReference.length > 128) {
+      return res.status(400).json({ error: 'Banka transferinin tamamlandığını onaylayın ve geçerli banka referansı girin.' });
+    }
+
+    try {
+      const result = await withTransaction(async (client) => {
+        const batchResult = await client.query(
+          `SELECT batch_id, status, currency, approved_by, created_by FROM payout_batches WHERE batch_id = $1 FOR UPDATE`,
+          [req.params.batchId]
+        );
+        if (!batchResult.rowCount) return { error: 'Toplu ödeme kaydı bulunamadı.', statusCode: 404 };
+        const batch = batchResult.rows[0];
+        if (batch.status === 'SETTLED') return { duplicate: true };
+        if (!['DRAFT', 'APPROVED'].includes(batch.status) || batch.currency !== 'TRY') {
+          return { error: 'Yalnızca taslak veya onaylanmış TRY toplu ödemeler tamamlanabilir.', statusCode: 409 };
+        }
+        if (batch.created_by === res.locals.adminUid) {
+          return { error: 'Taslağı oluşturan yönetici banka ödemesini onaylayıp kapatamaz.', statusCode: 403 };
+        }
+        const items = await client.query(
+          `SELECT bi.commission_id, bi.beneficiary_user_id, bi.gross_amount, bi.withholding_amount,
+                  bi.stamp_tax_amount, bi.net_amount, i.invoice_id, i.status AS invoice_status,
+                  c.status AS commission_status, c.clawback_status, o.payment_status
+           FROM payout_batch_items bi
+           JOIN accounting_invoices i ON i.commission_id = bi.commission_id
+           JOIN commission_logs c ON c.commission_id = bi.commission_id
+           JOIN orders o ON o.order_id = c.order_id
+           WHERE bi.batch_id = $1 ORDER BY bi.beneficiary_user_id, bi.commission_id
+           FOR UPDATE OF bi, i, c, o`,
+          [req.params.batchId]
+        );
+        if (!items.rowCount || items.rows.some((item) =>
+          item.invoice_status !== 'ISSUED' || item.commission_status !== 'RELEASED' ||
+          item.clawback_status !== 'RELEASED_TO_BALANCE' ||
+          !['PAID', 'CONFIRMED', 'COMPLETED'].includes(item.payment_status)
+        )) {
+          return { error: 'Her ödeme kalemi için yayımlanmış gider pusulası, aktif hakediş ve ödenmiş sipariş zorunludur.', statusCode: 409 };
+        }
+        for (const item of items.rows) {
+          const net = Number(item.net_amount);
+          const gross = Number(item.gross_amount);
+          const withholdingAndStamp = roundCurrency(Number(item.withholding_amount) + Number(item.stamp_tax_amount));
+          const wallet = await client.query(
+            `UPDATE members SET wallet_try = wallet_try - $1, total_withdrawn = total_withdrawn + $2, updated_at = NOW()
+             WHERE user_id = $3 AND wallet_try >= $1 RETURNING user_id`,
+            [gross, net, item.beneficiary_user_id]
+          );
+          if (!wallet.rowCount) throw new Error(`Bayi cüzdan bakiyesi yetersiz veya bayi bulunamadı: ${item.beneficiary_user_id}`);
+
+          await client.query(
+            `INSERT INTO wallet_transactions (
+               transaction_id, transaction_type, user_id, amount, currency, direction, description, reference_event_id
+             ) VALUES ($1, 'PAYOUT', $2, $3, 'TRY', 'DEBIT', $4, $5)`,
+            [`PAYOUT-${item.commission_id}`, item.beneficiary_user_id, net, `Banka toplu ödeme ${bankReference}`, item.commission_id]
+          );
+
+          if (withholdingAndStamp > 0) {
+            await client.query(
+              `INSERT INTO wallet_transactions (
+                 transaction_id, transaction_type, user_id, amount, currency, direction, description, reference_event_id
+               ) VALUES ($1, 'PAYOUT_TAX_WITHHOLDING', $2, $3, 'TRY', 'DEBIT', $4, $5)`,
+              [`PAYOUT-TAX-${item.commission_id}`, item.beneficiary_user_id, withholdingAndStamp, 'Gider pusulası vergi ve fon kesintileri', item.commission_id]
+            );
+            const taxKey = createHash('sha256').update(`PAYOUT_TAX:${item.commission_id}`).digest('hex');
+            await client.query(
+              `INSERT INTO journal_entries (
+                 voucher_number, source_event_type, source_event_id, currency,
+                 debit_account_code, debit_account_name, debit_amount,
+                 credit_account_code, credit_account_name, credit_amount, description, reconciled, idempotency_key
+               ) VALUES ($1, 'PAYOUT_TAX_WITHHELD', $2, 'TRY', '320.01', 'Bayi Cari Hakediş Hesabı', $3,
+                        '360.01', 'Ödenecek Vergi ve Fonlar', $3, $4, true, $5)`,
+              [`YEV-${taxKey.slice(0, 32)}`, item.commission_id, withholdingAndStamp, 'Gider pusulası kesintilerinin vergi borcuna aktarılması', taxKey]
+            );
+          }
+
+          const payoutKey = createHash('sha256').update(`PAYOUT_SETTLED:${item.commission_id}`).digest('hex');
+          await client.query(
+            `INSERT INTO journal_entries (
+               voucher_number, source_event_type, source_event_id, currency,
+               debit_account_code, debit_account_name, debit_amount,
+               credit_account_code, credit_account_name, credit_amount, description, reconciled, idempotency_key
+             ) VALUES ($1, 'PAYOUT_SETTLED', $2, 'TRY', '320.01', 'Bayi Cari Hakediş Hesabı', $3,
+                      '102.02', 'Banka Hesabı', $3, $4, true, $5)`,
+            [`YEV-${payoutKey.slice(0, 32)}`, item.commission_id, net, `Banka ödemesi ${bankReference}`, payoutKey]
+          );
+          await client.query(
+            `UPDATE payout_batch_items SET status = 'SETTLED', settled_at = NOW() WHERE batch_id = $1 AND commission_id = $2`,
+            [req.params.batchId, item.commission_id]
+          );
+          await client.query(
+            `UPDATE accounting_invoices SET payout_batch_id = $1, updated_at = NOW() WHERE commission_id = $2`,
+            [req.params.batchId, item.commission_id]
+          );
+        }
+        await client.query(
+          `UPDATE payout_batches SET status = 'SETTLED',
+             approved_by = COALESCE(approved_by, $2), approved_at = COALESCE(approved_at, NOW()),
+             settled_by = $2, settled_at = NOW(), settlement_reference = $3
+           WHERE batch_id = $1`,
+          [req.params.batchId, res.locals.adminUid, bankReference]
+        );
+        return { success: true, status: 'SETTLED', paid_count: items.rowCount, bank_reference: bankReference };
+      });
+      if ('error' in result) return res.status(result.statusCode).json({ error: result.error });
+      return res.json(result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Ödeme işlemi tamamlanamadı.';
+      await getPostgresPool().query(
+        `INSERT INTO accounting_anomalies (source_event_id, anomaly_type, severity, message)
+         VALUES ($1, 'PAYOUT_COMPLETION_FAILED', 'HIGH', $2)
+         ON CONFLICT (source_event_id, anomaly_type) DO UPDATE SET message = EXCLUDED.message`,
+        [String(req.params.batchId), message.slice(0, 1000)]
+      ).catch(() => {});
+      return res.status(409).json({ error: message });
+    }
+  });
+
+  async function processAccountingQueue() {
+    const pool = getPostgresPool();
+    await pool.query(
+      `UPDATE accounting_jobs SET status = 'PENDING', locked_at = NULL
+       WHERE status = 'PROCESSING' AND locked_at < NOW() - INTERVAL '10 minutes'`
+    );
+
+    for (let index = 0; index < 10; index++) {
+      const job = await withTransaction(async (client) => {
+        const selected = await client.query(
+          `SELECT id, source_event_id, attempts FROM accounting_jobs
+           WHERE status = 'PENDING' AND run_after <= NOW() AND attempts < 8
+           ORDER BY run_after, id FOR UPDATE SKIP LOCKED LIMIT 1`
+        );
+        if (!selected.rowCount) return null;
+        const picked = selected.rows[0];
+        await client.query(
+          `UPDATE accounting_jobs SET status = 'PROCESSING', locked_at = NOW(), attempts = attempts + 1
+           WHERE id = $1`,
+          [picked.id]
+        );
+        return picked;
+      });
+      if (!job) break;
+
+      try {
+        const key = accountingPiiKey();
+        if (!key) throw new Error('ACCOUNTING_PII_ENCRYPTION_KEY yapılandırılmamış.');
+        let issuer: Record<string, unknown>;
+        try {
+          issuer = JSON.parse(process.env.ACCOUNTING_ISSUER_PROFILE || '{}');
+        } catch {
+          issuer = {};
+        }
+        if (!issuer || typeof issuer !== 'object' || !Object.keys(issuer).length) {
+          throw new Error('ACCOUNTING_ISSUER_PROFILE yapılandırılmamış.');
+        }
+
+        await withTransaction(async (client) => {
+          const result = await client.query(
+            `SELECT c.commission_id, c.order_id, c.beneficiary_user_id, c.amount, c.currency,
+                    c.release_at, o.payment_status, m.full_name,
+                    p.tax_id_ciphertext, p.tax_office_ciphertext, p.address_ciphertext,
+                    p.iban_ciphertext, p.iban_holder_ciphertext, p.is_company,
+                    tr.id AS tax_rule_id, tr.withholding_rate, tr.stamp_tax_rate
+             FROM commission_logs c
+             JOIN orders o ON o.order_id = c.order_id
+             JOIN members m ON m.user_id = c.beneficiary_user_id
+             LEFT JOIN member_payout_profiles p ON p.beneficiary_user_id = c.beneficiary_user_id
+             LEFT JOIN LATERAL (
+               SELECT id, withholding_rate, stamp_tax_rate FROM accounting_tax_rules
+               WHERE enabled = TRUE AND approved_by IS NOT NULL AND approved_at IS NOT NULL
+                 AND member_type = CASE WHEN p.is_company THEN 'COMPANY' ELSE 'INDIVIDUAL' END
+                 AND effective_from <= CURRENT_DATE
+               ORDER BY effective_from DESC LIMIT 1
+             ) tr ON TRUE
+             WHERE c.commission_id = $1 AND c.status = 'RELEASED'
+               AND c.release_at <= NOW() AND o.payment_status IN ('PAID', 'CONFIRMED', 'COMPLETED')
+             FOR UPDATE OF c`,
+            [job.source_event_id]
+          );
+          const commission = result.rows[0];
+          if (!commission) throw new Error('Hakediş ödenmiş siparişe bağlı değil, kesinleşmemiş veya bulunamadı.');
+          if (!commission.tax_id_ciphertext || !commission.address_ciphertext || !commission.iban_ciphertext || !commission.iban_holder_ciphertext) {
+            throw new Error('Bayi vergi ve ödeme profili eksik.');
+          }
+          if (commission.tax_rule_id == null) throw new Error('Yürürlükte ve yönetici tarafından onaylanmış vergi kuralı bulunamadı.');
+
+          const beneficiary = {
+            userId: commission.beneficiary_user_id,
+            name: commission.full_name,
+            taxId: decryptAccountingPii(commission.tax_id_ciphertext, key),
+            taxOffice: commission.tax_office_ciphertext ? decryptAccountingPii(commission.tax_office_ciphertext, key) : null,
+            address: decryptAccountingPii(commission.address_ciphertext, key),
+            iban: decryptAccountingPii(commission.iban_ciphertext, key),
+            ibanHolder: decryptAccountingPii(commission.iban_holder_ciphertext, key),
+            isCompany: commission.is_company,
+          };
+          const gross = roundCurrency(Number(commission.amount));
+          const withholding = roundCurrency(gross * Number(commission.withholding_rate));
+          const stampTax = roundCurrency(gross * Number(commission.stamp_tax_rate));
+          const net = roundCurrency(gross - withholding - stampTax);
+          if (gross <= 0 || net < 0 || !['TRY', 'USD'].includes(String(commission.currency).toUpperCase())) {
+            throw new Error('Hakediş tutarı veya para birimi gider pusulası taslağı için geçersiz.');
+          }
+
+          const invoiceId = `GDP-${commission.commission_id}`;
+          const invoiceKey = createHash('sha256').update(`ACCOUNTING_INVOICE:${commission.commission_id}`).digest('hex');
+          await client.query(
+            `INSERT INTO accounting_invoices (
+               invoice_id, source_event_id, idempotency_key, commission_id, beneficiary_user_id,
+               document_type, status, currency, gross_amount, withholding_amount, stamp_tax_amount,
+               net_amount, tax_rule_id, beneficiary_snapshot_ciphertext, company_snapshot_ciphertext,
+               last_error
+             ) VALUES ($1, $2, $3, $4, $5, 'GIDER_PUSULASI', 'PROVIDER_NOT_CONFIGURED', $6, $7, $8, $9, $10,
+                       $11, $12, $13, $14)
+             ON CONFLICT (idempotency_key) DO NOTHING`,
+            [
+              invoiceId,
+              commission.commission_id,
+              invoiceKey,
+              commission.commission_id,
+              commission.beneficiary_user_id,
+              String(commission.currency).toUpperCase(),
+              gross,
+              withholding,
+              stampTax,
+              net,
+              commission.tax_rule_id,
+              encryptAccountingPii(beneficiary, key),
+              encryptAccountingPii(issuer, key),
+              'E-dönüşüm sağlayıcısı yapılandırılmadı; taslak resmi belge değildir.',
+            ]
+          );
+          await client.query(
+            `INSERT INTO accounting_anomalies (source_event_id, anomaly_type, severity, message)
+             VALUES ($1, 'EINVOICE_PROVIDER_NOT_CONFIGURED', 'HIGH', $2)
+             ON CONFLICT (source_event_id, anomaly_type) DO NOTHING`,
+            [commission.commission_id, 'Gider pusulası taslağı oluşturuldu ancak e-dönüşüm sağlayıcısı yapılandırılmadı.']
+          );
+          await client.query(
+            `UPDATE accounting_jobs SET status = 'COMPLETED', locked_at = NULL, completed_at = NOW(), last_error = NULL
+             WHERE id = $1`,
+            [job.id]
+          );
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Muhasebe belgesi taslağı oluşturulamadı.';
+        await withTransaction(async (client) => {
+          await client.query(
+            `UPDATE accounting_jobs SET status = CASE WHEN attempts >= 8 THEN 'FAILED' ELSE 'PENDING' END,
+               run_after = NOW() + INTERVAL '15 minutes', locked_at = NULL, last_error = $2
+             WHERE id = $1`,
+            [job.id, message.slice(0, 1000)]
+          );
+          await client.query(
+            `INSERT INTO accounting_anomalies (source_event_id, anomaly_type, severity, message)
+             VALUES ($1, 'ACCOUNTING_DRAFT_CREATION_FAILED', 'HIGH', $2)
+             ON CONFLICT (source_event_id, anomaly_type) DO UPDATE SET message = EXCLUDED.message`,
+            [job.source_event_id, message.slice(0, 1000)]
+          );
+        });
+      }
+    }
+  }
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
@@ -9965,8 +10767,11 @@ async function startServer() {
   // Background Cron Job: Süresi dolan hesapları ve 14 günü dolan PENDING_14D komisyonları her 30 saniyede bir otomatik kontrol et
   setInterval(() => {
     checkAndExpireAccountsCron('ACTIVITY_EXPIRY_CRON');
-    releaseMaturedCommissions();
+    releaseMaturedCommissions().catch((error) => console.error('[Accounting release worker]', error.message));
   }, 30000);
+  setInterval(() => {
+    processAccountingQueue().catch((error) => console.error('[Accounting document worker]', error.message));
+  }, 10000);
 
   if (usdTryRateUpdatedAt === null) {
     console.warn(

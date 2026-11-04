@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { LEGAL_CONTRACT_TEXTS } from '../utils/paymentProcessor';
 import { 
   X, 
   FileText, 
@@ -18,7 +19,7 @@ import {
 } from 'lucide-react';
 import { BANK_INFO, ADMIN_PHONE, ADMIN_EMAILS } from '../utils/authManager';
 
-export type LegalContractTab = 'preInfo' | 'distanceSale' | 'cancellationRefund' | 'terms' | 'kvkk';
+export type LegalContractTab = 'preInfo' | 'distanceSale' | 'cancellationRefund' | 'terms' | 'mlmTerms' | 'kvkk';
 
 interface LegalContractsModalProps {
   isOpen: boolean;
@@ -32,6 +33,10 @@ export const LegalContractsModal: React.FC<LegalContractsModalProps> = ({
   initialTab = 'preInfo',
 }) => {
   const [activeTab, setActiveTab] = useState<LegalContractTab>(initialTab);
+
+  useEffect(() => {
+    if (isOpen) setActiveTab(initialTab);
+  }, [initialTab, isOpen]);
 
   if (!isOpen) return null;
 
@@ -85,7 +90,7 @@ export const LegalContractsModal: React.FC<LegalContractsModalProps> = ({
         </div>
 
         {/* Tab Buttons (5 Comprehensive Tabs) */}
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 p-1.5 bg-slate-950 rounded-2xl border border-slate-800 shrink-0">
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 p-1.5 bg-slate-950 rounded-2xl border border-slate-800 shrink-0">
           <button
             type="button"
             onClick={() => setActiveTab('preInfo')}
@@ -140,8 +145,21 @@ export const LegalContractsModal: React.FC<LegalContractsModalProps> = ({
 
           <button
             type="button"
+            onClick={() => setActiveTab('mlmTerms')}
+            className={`py-2 px-2 rounded-xl text-[11px] sm:text-xs font-bold transition-all flex items-center justify-center gap-1 text-center ${
+              activeTab === 'mlmTerms'
+                ? 'bg-emerald-600 text-white shadow-md'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+            }`}
+          >
+            <UserCheck className="w-3.5 h-3.5 shrink-0" />
+            <span className="truncate">MLM & Bayilik</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => setActiveTab('kvkk')}
-            className={`col-span-2 sm:col-span-1 py-2 px-2 rounded-xl text-[11px] sm:text-xs font-bold transition-all flex items-center justify-center gap-1 text-center ${
+            className={`py-2 px-2 rounded-xl text-[11px] sm:text-xs font-bold transition-all flex items-center justify-center gap-1 text-center ${
               activeTab === 'kvkk'
                 ? 'bg-emerald-600 text-white shadow-md'
                 : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
@@ -360,7 +378,22 @@ export const LegalContractsModal: React.FC<LegalContractsModalProps> = ({
             </div>
           )}
 
-          {/* TAB 5: KVKK & GİZLİLİK POLİTİKASI */}
+          {activeTab === 'mlmTerms' && (
+            <div className="space-y-4 p-4 sm:p-5 rounded-2xl bg-slate-950/80 border border-slate-800">
+              <div className="p-3.5 rounded-xl bg-emerald-950/40 border border-emerald-500/30 text-emerald-300 font-semibold text-xs flex items-center gap-2">
+                <UserCheck className="w-4 h-4 shrink-0" />
+                <span>{LEGAL_CONTRACT_TEXTS.MLM_TERMS.title} · {LEGAL_CONTRACT_TEXTS.MLM_TERMS.version}</span>
+              </div>
+              <p>{LEGAL_CONTRACT_TEXTS.MLM_TERMS.summary}</p>
+              <div className="space-y-3">
+                {LEGAL_CONTRACT_TEXTS.MLM_TERMS.clauses.map((clause) => (
+                  <p key={clause} className="rounded-xl border border-slate-800 bg-slate-900/60 p-3">{clause}</p>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* TAB 6: KVKK & GİZLİLİK POLİTİKASI */}
           {activeTab === 'kvkk' && (
             <div className="space-y-4 p-4 sm:p-5 rounded-2xl bg-slate-950/80 border border-slate-800">
               <div className="p-3.5 rounded-xl bg-cyan-950/40 border border-cyan-500/30 text-cyan-300 font-semibold text-xs flex items-center gap-2">
@@ -413,7 +446,7 @@ export const LegalContractsModal: React.FC<LegalContractsModalProps> = ({
             onClick={onClose}
             className="w-full sm:w-auto px-7 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-lg shadow-emerald-950/60 transition-all cursor-pointer"
           >
-            Okudum, Anladım & Kabul Ediyorum
+            Kapat
           </button>
         </div>
 

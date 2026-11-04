@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { getAdminToken } from '../../utils/adminSession';
 import { CommissionPayout, Distributor } from '../../types/accounting';
 import {
   Users,
@@ -13,6 +14,34 @@ import {
 } from 'lucide-react';
 import avatarDistributor from '../../assets/images/avatar_distributor_lead_1792512086444.jpg';
 
+interface EligiblePayout {
+  commission_id: string;
+  beneficiary_user_id: string;
+  beneficiary_name: string;
+  iban: string;
+  iban_holder: string;
+  bank_name: string | null;
+  invoice_id: string;
+  currency: string;
+  gross_amount: number;
+  withholding_amount: number;
+  stamp_tax_amount: number;
+  net_amount: number;
+  wallet_balance: number;
+}
+
+interface PayoutBatch {
+  batch_id: string;
+  status: string;
+  currency: string;
+  gross_total: number | string;
+  withholding_total: number | string;
+  stamp_tax_total: number | string;
+  net_total: number | string;
+  item_count: number;
+  created_by: string;
+}
+
 interface CommissionsViewProps {
   distributors: Distributor[];
   commissions: CommissionPayout[];
@@ -25,6 +54,133 @@ export const CommissionsView: React.FC<CommissionsViewProps> = ({
   onOpenGiderPusulasi,
 }) => {
   const [filterType, setFilterType] = useState<'ALL' | 'INDIVIDUAL' | 'COMPANY'>('ALL');
+  const [eligiblePayouts, setEligiblePayouts] = useState<EligiblePayout[]>([]);
+  const [payoutBatches, setPayoutBatches] = useState<PayoutBatch[]>([]);
+  const [selectedPayoutIds, setSelectedPayoutIds] = useState<string[]>([]);
+  const [payoutFilter, setPayoutFilter] = useState('');
+  const [payoutMessage, setPayoutMessage] = useState('');
+  const [payoutBusy, setPayoutBusy] = useState(false);
+
+  const loadPayoutData = async () => {
+    const headers = { Authorization: `Bearer ${getAdminToken() ?? ''}` };
+    const [eligibleResponse, batchesResponse] = await Promise.all([
+      fetch('/api/v1/integrations/accounting/payout-eligible', { headers }),
+      fetch('/api/v1/integrations/accounting/payout-batches', { headers }),
+    ]);
+    if (!eligibleResponse.ok || !batchesResponse.ok) throw new Error('Ödeme verileri yüklenemedi.');
+    const [eligibleData, batchData] = await Promise.all([eligibleResponse.json(), batchesResponse.json()]);
+    setEligiblePayouts(eligibleData.payouts || []);
+    setPayoutBatches(batchData.batches || []);
+  };
+
+  useEffect(() => {
+    loadPayoutData().catch((error) => setPayoutMessage(error.message));
+  }, []);
+
+  const filteredPayouts = eligiblePayouts.filter((payout) =>
+    `${payout.beneficiary_name} ${payout.iban} ${payout.beneficiary_user_id}`
+      .toLocaleLowerCase('tr-TR')
+      .includes(payoutFilter.toLocaleLowerCase('tr-TR'))
+  );
+
+  const downloadBankFile = (rows: EligiblePayout[], filename: string) => {
+    const safeCell = (value: unknown) => {
+      const text = String(value ?? '');
+      const safe = /^[\s=+@-]/.test(text) ? `'${text}` : text;
+      return `"${safe.replace(/"/g, '""')}"`;
+    };
+    const csv = [
+      ['Bayi Adı', 'IBAN Hesap Sahibi', 'IBAN', 'Banka', 'Para Birimi', 'Brüt Tutar', 'Stopaj', 'Diğer Kesinti', 'Net Ödeme', 'Komisyon ID', 'Gider Pusulası No'],
+      ...rows.map((row) => [row.beneficiary_name, row.iban_holder, row.iban, row.bank_name || '', row.currency,
+        row.gross_amount.toFixed(2), row.withholding_amount.toFixed(2), row.stamp_tax_amount.toFixed(2),
+        row.net_amount.toFixed(2), row.commission_id, row.invoice_id]),
+    ].map((line) => line.map(safeCell).join(';')).join('\r\n');
+    const url = URL.createObjectURL(new Blob(['\uFEFF', csv], { type: 'text/csv;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const createPayoutBatch = async () => {
+    if (!selectedPayoutIds.length) return;
+    setPayoutBusy(true);
+    setPayoutMessage('');
+    try {
+      const response = await fetch('/api/v1/integrations/accounting/payout-batches', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getAdminToken() ?? ''}` },
+        body: JSON.stringify({ commission_ids: selectedPayoutIds, idempotency_key: crypto.randomUUID() }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Ödeme taslağı oluşturulamadı.');
+      setSelectedPayoutIds([]);
+      setPayoutMessage(`Toplu ödeme taslağı oluşturuldu: ${data.batch.batch_id}. Banka dosyasını aşağıdaki geçmişten indirebilirsiniz.`);
+      await loadPayoutData();
+    } catch (error) {
+      setPayoutMessage(error instanceof Error ? error.message : 'İşlem başarısız.');
+    } finally {
+      setPayoutBusy(false);
+    }
+  };
+
+  const cancelPayoutBatch = async (batchId: string) => {
+    if (!window.confirm('Bu taslak banka listesi iptal edilsin mi? İptal sonrası komisyon yeniden seçilebilir.')) return;
+    setPayoutBusy(true);
+    setPayoutMessage('');
+    try {
+      const response = await fetch(`/api/v1/integrations/accounting/payout-batches/${encodeURIComponent(batchId)}/cancel`, {
+        method: 'POST', headers: { Authorization: `Bearer ${getAdminToken() ?? ''}` },
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Ödeme taslağı iptal edilemedi.');
+      setPayoutMessage('Ödeme taslağı iptal edildi; komisyonlar yeniden seçilebilir.');
+      await loadPayoutData();
+    } catch (error) {
+      setPayoutMessage(error instanceof Error ? error.message : 'İşlem başarısız.');
+    } finally {
+      setPayoutBusy(false);
+    }
+  };
+
+  const completePayoutBatch = async (batchId: string) => {
+    const bankReference = window.prompt('Bankanın işlem/dekont referansını girin:');
+    if (!bankReference) return;
+    if (!window.confirm('Bankaya transferin başarıyla yapıldığını ve bu referansla doğruladığınızı onaylıyor musunuz?')) return;
+    setPayoutBusy(true);
+    setPayoutMessage('');
+    try {
+      const response = await fetch(`/api/v1/integrations/accounting/payout-batches/${encodeURIComponent(batchId)}/complete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getAdminToken() ?? ''}` },
+        body: JSON.stringify({ bank_reference: bankReference, bank_transfer_completed: true }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Ödeme tamamlanamadı.');
+      setPayoutMessage(data.duplicate
+        ? 'Bu toplu ödeme daha önce tamamlanmış.'
+        : `Ödeme tamamlandı: ${data.paid_count} komisyon, banka referansı ${data.bank_reference}.`);
+      await loadPayoutData();
+    } catch (error) {
+      setPayoutMessage(error instanceof Error ? error.message : 'İşlem başarısız.');
+    } finally {
+      setPayoutBusy(false);
+    }
+  };
+
+  const downloadBatchFile = async (batchId: string) => {
+    try {
+      const response = await fetch(`/api/v1/integrations/accounting/payout-batches/${encodeURIComponent(batchId)}`, {
+        headers: { Authorization: `Bearer ${getAdminToken() ?? ''}` },
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Banka dosyası hazırlanamadı.');
+      downloadBankFile(data.items, `${batchId}-banka-odeme.csv`);
+    } catch (error) {
+      setPayoutMessage(error instanceof Error ? error.message : 'Banka dosyası indirilemedi.');
+    }
+  };
 
   const filteredCommissions = commissions.filter((comm) => {
     if (filterType === 'INDIVIDUAL') return !comm.isCompany;
@@ -229,6 +385,71 @@ export const CommissionsView: React.FC<CommissionsViewProps> = ({
           </table>
         </div>
       </div>
+
+      <section className="space-y-4 rounded-xl border border-slate-200 bg-white p-5 shadow-xs">
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-900">Toplu Bayi Komisyon ve Banka Ödemeleri</h3>
+            <p className="text-xs text-slate-500">Yayımlanmış gider pusulası, serbest hakediş ve yeterli cüzdan bakiyesi olan TRY ödemeleri.</p>
+          </div>
+          <input
+            value={payoutFilter}
+            onChange={(event) => setPayoutFilter(event.target.value)}
+            placeholder="Bayi, IBAN veya kullanıcı ara"
+            className="w-full rounded-md border border-slate-300 px-3 py-2 text-xs md:w-64"
+          />
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            disabled={!selectedPayoutIds.length || payoutBusy}
+            onClick={createPayoutBatch}
+            className="rounded-md bg-blue-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40"
+          >Seçilenlerden Ödeme Taslağı Oluştur ({selectedPayoutIds.length})</button>
+          <span className="text-[11px] text-slate-500">Taslağı oluşturan dosyayı indirir; banka transferinden sonra farklı yönetici ödemeyi onaylayıp kapatır.</span>
+        </div>
+        <div className="overflow-x-auto rounded-lg border border-slate-200">
+          <table className="w-full min-w-[1050px] text-left text-xs">
+            <thead className="bg-slate-50 text-slate-600">
+              <tr>
+                <th className="p-3"><input type="checkbox" aria-label="Filtrelenmiş tüm ödemeleri seç" checked={filteredPayouts.length > 0 && filteredPayouts.every((row) => selectedPayoutIds.includes(row.commission_id))} onChange={(event) => setSelectedPayoutIds(event.target.checked ? [...new Set([...selectedPayoutIds, ...filteredPayouts.map((row) => row.commission_id)])] : selectedPayoutIds.filter((id) => !filteredPayouts.some((row) => row.commission_id === id)))} /></th>
+                <th className="p-3">Bayi / IBAN</th><th className="p-3">Banka</th><th className="p-3">Belge</th>
+                <th className="p-3 text-right">Brüt</th><th className="p-3 text-right">Stopaj</th><th className="p-3 text-right">Diğer kesinti</th>
+                <th className="p-3 text-right">Net ödenecek</th><th className="p-3 text-right">Cüzdan bakiyesi</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {filteredPayouts.map((row) => (
+                <tr key={row.commission_id}>
+                  <td className="p-3"><input type="checkbox" checked={selectedPayoutIds.includes(row.commission_id)} onChange={(event) => setSelectedPayoutIds((ids) => event.target.checked ? [...ids, row.commission_id] : ids.filter((id) => id !== row.commission_id))} /></td>
+                  <td className="p-3"><strong>{row.beneficiary_name}</strong><span className="block font-mono text-[10px] text-slate-500">{row.iban_holder} · {row.iban}</span></td>
+                  <td className="p-3">{row.bank_name || '—'}</td><td className="p-3 font-mono">{row.invoice_id}</td>
+                  <td className="p-3 text-right">{row.gross_amount.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} ₺</td>
+                  <td className="p-3 text-right">{row.withholding_amount.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} ₺</td>
+                  <td className="p-3 text-right">{row.stamp_tax_amount.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} ₺</td>
+                  <td className="p-3 text-right font-semibold text-emerald-700">{row.net_amount.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} ₺</td>
+                  <td className="p-3 text-right">{row.wallet_balance.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} ₺</td>
+                </tr>
+              ))}
+              {!filteredPayouts.length && <tr><td className="p-5 text-center text-slate-500" colSpan={9}>Şu anda banka ödemesine uygun komisyon bulunmuyor.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        {payoutMessage && <p role="status" className="text-xs text-slate-700">{payoutMessage}</p>}
+        <div className="space-y-2">
+          <h4 className="text-xs font-semibold text-slate-800">Toplu ödeme geçmişi</h4>
+          {payoutBatches.length === 0 && <p className="text-xs text-slate-500">Henüz toplu ödeme taslağı oluşturulmadı.</p>}
+          {payoutBatches.map((batch) => (
+            <div key={batch.batch_id} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 p-3 text-xs">
+              <div><strong className="font-mono">{batch.batch_id}</strong><span className="ml-2 rounded bg-slate-100 px-2 py-1">{batch.status}</span><p className="mt-1 text-slate-500">{batch.item_count} bayi · Net {Number(batch.net_total).toLocaleString('tr-TR', { minimumFractionDigits: 2 })} ₺ · Oluşturan: {batch.created_by}</p></div>
+              <div className="flex flex-wrap gap-2">
+                {['DRAFT', 'APPROVED', 'SETTLED'].includes(batch.status) && <button disabled={payoutBusy} onClick={() => downloadBatchFile(batch.batch_id)} className="rounded border border-slate-300 px-3 py-2 font-semibold">Banka İçin Toplu Ödeme Listesi İndir</button>}
+                {['DRAFT', 'APPROVED'].includes(batch.status) && <button disabled={payoutBusy} onClick={() => completePayoutBatch(batch.batch_id)} className="rounded bg-emerald-700 px-3 py-2 font-semibold text-white">Seçilenleri onayla ve ödemeyi tamamla</button>}
+                {batch.status === 'DRAFT' && <button disabled={payoutBusy} onClick={() => cancelPayoutBatch(batch.batch_id)} className="rounded border border-red-300 px-3 py-2 font-semibold text-red-700">Taslağı iptal et</button>}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
     </div>
   );
 };
