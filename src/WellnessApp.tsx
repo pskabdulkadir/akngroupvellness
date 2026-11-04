@@ -19,7 +19,7 @@ import { Vpos3DSecureModal } from './components/Vpos3DSecureModal';
 import { MembershipWaitingOverlay } from './components/MembershipWaitingOverlay';
 import { AdminPanelModal, ADMIN_SESSION_KEY, ADMIN_TAB_KEY } from './components/AdminPanelModal';
 import { subscribeToSiteContent } from './utils/siteContentManager';
-import { clearAdminToken } from './utils/adminSession';
+import { clearAdminToken, getAdminToken } from './utils/adminSession';
 import { ResellerDashboardModal } from './components/ResellerDashboardModal';
 import { DealerBusinessCardModal } from './components/DealerBusinessCardModal';
 import { UserGuideModal } from './components/UserGuideModal';
@@ -1449,7 +1449,7 @@ export default function WellnessApp({
           handleNavigate('camera');
         }}
         initialSubTab={monolineInitialSubTab}
-        isAdminAuthenticated={false}
+        isAdminAuthenticated={Boolean(getAdminToken())}
         onOpenSmartAccounting={onOpenSmartAccounting}
       />
 
