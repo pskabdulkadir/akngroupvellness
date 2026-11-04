@@ -549,7 +549,10 @@ export async function syncFrekansWithMonolineEngine(options?: {
 
       const res = await fetch('/api/v1/integrations/sync-frekans-data', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${getAdminToken()}`,
+        },
         body: JSON.stringify({
           members: Array.from(unifiedMembersMap.values()),
           orders: Array.from(unifiedOrdersMap.values()),

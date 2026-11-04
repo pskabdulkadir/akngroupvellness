@@ -716,9 +716,13 @@ export default function WellnessApp({
     };
   }, []);
 
-  const handleAuthSuccess = (user: UserMember) => {
+  const handleAuthSuccess = (user: UserMember, isNewRegistration = false) => {
     setCurrentUser(user);
     setIsAuthModalOpen(false);
+    if (isNewRegistration) {
+      setIsPaymentModalOpen(true);
+      return;
+    }
     const access = checkMemberAccess(user);
     if (!access.isAllowed) {
       setIsPaymentModalOpen(true);

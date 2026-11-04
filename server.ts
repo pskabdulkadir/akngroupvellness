@@ -1160,14 +1160,11 @@ function processOrderCommission(payload: OrderCommissionPayload): CommissionTran
     }
     // Auto-onboard external Frekans app user into Monoline Global Single Line
     const nextLineId = members.length + 1;
-    const rawSponsor = (payload as any).sponsor_id || (payload as any).referred_by_code || '';
-    const matchedSponsor = rawSponsor
-      ? members.find(
-          (m) =>
-            m.user_id === rawSponsor ||
-            (m.ref_code && m.ref_code.toUpperCase() === String(rawSponsor).toUpperCase())
-        )
-      : members[0];
+    const matchedSponsor = members.reduce<MonolineMember | undefined>(
+      (latest, member) =>
+        !latest || member.global_line_id > latest.global_line_id ? member : latest,
+      undefined
+    );
 
     const autoMember: MonolineMember = {
       id: nextLineId,
@@ -5671,6 +5668,7 @@ async function startServer() {
         }
 
         const incomingMembers = Array.isArray(frekansMembers) ? [...frekansMembers] : [];
+        const newlyPlacedMemberIds = new Set<string>();
         incomingMembers.sort(
           (a, b) =>
             new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime()
@@ -5695,6 +5693,11 @@ async function startServer() {
               typeof fm.creditsBalance === 'number' && fm.creditsBalance > 0
                 ? fm.creditsBalance
                 : WELCOME_BONUS_TOTAL_CREDITS;
+            const placementSponsor = members.reduce<MonolineMember | undefined>(
+              (latest, member) =>
+                !latest || member.global_line_id > latest.global_line_id ? member : latest,
+              undefined
+            );
             existing = {
               id: nextLineId,
               user_id: uid,
@@ -5707,8 +5710,8 @@ async function startServer() {
               phone: String(fm.phone || '').trim(),
               city: String(fm.city || 'Türkiye').trim(),
               joined_at: fm.createdAt || new Date().toISOString(),
-              sponsor_id: null,
-              sponsor_db_id: null,
+              sponsor_id: placementSponsor?.user_id || null,
+              sponsor_db_id: placementSponsor?.id || null,
               highest_package_id: pkgKey,
               session_credits: initialCreditsVal,
               personal_volume: 0,
@@ -5742,6 +5745,7 @@ async function startServer() {
               welcome_bonus_credits: WELCOME_BONUS_TOTAL_CREDITS,
             };
             members.push(existing);
+            newlyPlacedMemberIds.add(existing.user_id);
             logActivityEvent({
               member: existing,
               action_type: 'WELCOME_BONUS_GRANTED',
@@ -5776,7 +5780,7 @@ async function startServer() {
         for (const fm of incomingMembers) {
           if (!fm || !fm.uid) continue;
           const member = members.find((m) => m.user_id === String(fm.uid).trim());
-          if (!member) continue;
+          if (!member || newlyPlacedMemberIds.has(member.user_id)) continue;
 
           const refByCode = String(fm.referredByCode || '').trim().toUpperCase();
           const resId = String(fm.resellerId || '').trim();
@@ -5893,7 +5897,6 @@ async function startServer() {
         ref_code,
         city,
         country_code,
-        sponsor_id,
         initial_package_id,
         manual_career_override,
         skip_initial_order,
@@ -5942,12 +5945,11 @@ async function startServer() {
         const pkgKey =
           normalizePackageId(initial_package_id || 'PKG_ALTIN_PRO') || 'PKG_ALTIN_PRO';
         const nowIso = new Date().toISOString();
-        const sponsorMember =
-          sponsor_id === '' || sponsor_id === null
-            ? undefined
-            : sponsor_id
-            ? members.find((m) => m.user_id === sponsor_id)
-            : members[0];
+        const sponsorMember = members.reduce<MonolineMember | undefined>(
+          (latest, member) =>
+            !latest || member.global_line_id > latest.global_line_id ? member : latest,
+          undefined
+        );
 
         const customRef = ref_code ? String(ref_code).trim().toUpperCase() : '';
         const authHdr = req.headers.authorization;
@@ -9049,6 +9051,11 @@ async function startServer() {
         }
 
         const nextLineId = members.length + 1;
+        const placementSponsor = members.reduce<MonolineMember | undefined>(
+          (latest, member) =>
+            !latest || member.global_line_id > latest.global_line_id ? member : latest,
+          undefined
+        );
         const randSuffix = Math.random().toString(36).substring(2, 8).toUpperCase();
         const newUserId = `USR-${randSuffix}`;
         const nowIso = new Date().toISOString();
@@ -9056,12 +9063,12 @@ async function startServer() {
         let finalLeg: 'LEFT' | 'RIGHT' = 'LEFT';
         if (assigned_leg === 'LEFT' || assigned_leg === 'RIGHT') {
           finalLeg = assigned_leg;
-        } else if (sponsor) {
+        } else if (placementSponsor) {
           const leftCount = members.filter(
-            (m) => m.sponsor_id === sponsor.user_id && (m as any).assigned_leg === 'LEFT'
+            (m) => m.sponsor_id === placementSponsor.user_id && (m as any).assigned_leg === 'LEFT'
           ).length;
           const rightCount = members.filter(
-            (m) => m.sponsor_id === sponsor.user_id && (m as any).assigned_leg === 'RIGHT'
+            (m) => m.sponsor_id === placementSponsor.user_id && (m as any).assigned_leg === 'RIGHT'
           ).length;
           finalLeg = leftCount <= rightCount ? 'LEFT' : 'RIGHT';
         }
@@ -9083,8 +9090,8 @@ async function startServer() {
           city: String(city || 'Türkiye').trim(),
           country_code: normalizedCountryCode,
           joined_at: nowIso,
-          sponsor_id: sponsor.user_id,
-          sponsor_db_id: sponsor.id,
+          sponsor_id: placementSponsor?.user_id || null,
+          sponsor_db_id: placementSponsor?.id || null,
           highest_package_id: normalizedPkg,
           session_credits: 0,
           personal_volume: 0,
