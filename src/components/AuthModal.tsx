@@ -845,9 +845,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               <input
                 type="password"
                 required
+                minLength={8}
                 value={regPassword}
                 onChange={(e) => setRegPassword(e.target.value)}
-                placeholder="En az 4 karakter"
+                placeholder="En az 8 karakter"
                 className="w-full px-3 py-2.5 rounded-xl bg-slate-950 border border-slate-700 focus:border-amber-500 text-xs text-slate-100 placeholder:text-slate-600 outline-none"
               />
             </div>

@@ -22,6 +22,7 @@ import {
   getLocalDealerOrders,
   saveLocalDealerOrders,
 } from './dealerOrderManager';
+import { getAdminToken } from './adminSession';
 import {
   CommissionTransaction as FrekansCommissionTx,
   Reseller,
@@ -193,6 +194,7 @@ let inFlightSync: Promise<SystemStateResponse | null> | null = null;
 export async function syncFrekansWithMonolineEngine(options?: {
   resetBeforeSync?: boolean;
 }): Promise<SystemStateResponse | null> {
+  if (!getAdminToken()) return null;
   if (inFlightSync && !options?.resetBeforeSync) {
     return inFlightSync;
   }

@@ -193,7 +193,7 @@ export const MonolineMlmPortalModal: React.FC<MonolineMlmPortalModalProps> = ({
 
   const fetchSystemState = async (runLiveSync = false) => {
     try {
-      if (runLiveSync) {
+      if (runLiveSync && isAdminAuthenticated) {
         const syncedState = await syncFrekansWithMonolineEngine();
         if (syncedState) {
           applyServerState(syncedState);
@@ -1457,7 +1457,12 @@ export const MonolineMlmPortalModal: React.FC<MonolineMlmPortalModalProps> = ({
               />
             )}
 
-            {activeTab === 'backoffice' && (
+            {activeTab === 'backoffice' && state.members.length === 0 && (
+              <div role="status" className="rounded-xl border border-slate-200 bg-white p-6 text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300">
+                Henüz gösterilecek bir üye veya bayi kaydı bulunmuyor.
+              </div>
+            )}
+            {activeTab === 'backoffice' && state.members.length > 0 && (
               <DealerBackOfficeView
                 subTab={dealerBackOfficeTab}
                 onSubTabChange={setDealerBackOfficeTab}

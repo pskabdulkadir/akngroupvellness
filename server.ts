@@ -3724,7 +3724,11 @@ seedInitialData();
 
 // Section 5: Admin oturum token'ı (HMAC-SHA256) ve Admin Endpoint Middleware
 const ADMIN_TOKEN_TTL_MS = 8 * 60 * 60 * 1000;
-const ADMIN_LOGIN_EMAIL = 'psikologabdulkadirkan@gmail.com';
+const DEFAULT_ADMIN_LOGIN_EMAIL = 'psikologabdulkadirkan@gmail.com';
+
+function getEffectiveAdminEmail(): string {
+  return (process.env.ADMIN_EMAIL || DEFAULT_ADMIN_LOGIN_EMAIL).trim().toLowerCase();
+}
 function validateRuntimeEnvironment(): void {
   const isPlaceholder = (value: string) =>
     /^(your|example|placeholder|change[-_ ]?me|default)/i.test(value) ||
@@ -3743,10 +3747,14 @@ function validateRuntimeEnvironment(): void {
     throw new Error('DATABASE_URL varsayılan/örnek bağlantı bilgileri içeremez.');
   }
 
+  const adminEmail = getEffectiveAdminEmail();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(adminEmail)) {
+    throw new Error('ADMIN_EMAIL geçerli bir e-posta adresi olmalıdır.');
+  }
+
   const adminPassword = process.env.ADMIN_PASSWORD?.trim() || '';
-  const passwordClasses = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter((pattern) => pattern.test(adminPassword)).length;
-  if (adminPassword.length < 16 || passwordClasses < 3 || isPlaceholder(adminPassword) || /^(admin|password|changeme|change-me|default|secret)/i.test(adminPassword)) {
-    throw new Error('ADMIN_PASSWORD en az 16 karakterli, güçlü ve varsayılan olmayan bir parola olmalıdır.');
+  if (adminPassword.length < 8) {
+    throw new Error('ADMIN_PASSWORD en az 8 karakter olmalıdır.');
   }
 
   const adminJwtSecret = process.env.ADMIN_JWT_SECRET?.trim() || '';
@@ -4306,19 +4314,13 @@ async function startServer() {
   app.post('/api/v1/admin/login', (req, res) => {
     const secret = getEffectiveAdminJwtSecret();
     const effectivePassword = getEffectiveAdminPassword();
+    const effectiveEmail = getEffectiveAdminEmail();
 
     const email = String(req.body?.email ?? '').trim().toLowerCase();
     const password = String(req.body?.password ?? '').trim();
-    const emailMatches = email === ADMIN_LOGIN_EMAIL.toLowerCase();
+    const emailMatches = email === effectiveEmail;
     const passwordMatches =
-      Boolean(password) &&
-      (password === effectivePassword ||
-        timingSafeEqual(sha256Digest(password), sha256Digest(effectivePassword)) ||
-        (Boolean(process.env.ADMIN_SECRET_PIN) &&
-          timingSafeEqual(
-            sha256Digest(password),
-            sha256Digest(process.env.ADMIN_SECRET_PIN as string)
-          )));
+      Boolean(password) && timingSafeEqual(sha256Digest(password), sha256Digest(effectivePassword));
 
     if (!emailMatches || !passwordMatches) {
       res.status(401).json({
@@ -4333,7 +4335,7 @@ async function startServer() {
     res.json({
       status: 'success',
       token,
-      admin_email: ADMIN_LOGIN_EMAIL,
+      admin_email: effectiveEmail,
       expires_in_ms: ADMIN_TOKEN_TTL_MS,
     });
   });
@@ -5914,6 +5916,10 @@ async function startServer() {
         });
         return;
       }
+      if (password && String(password).length < 8) {
+        res.status(400).json({ status: 'error', code: 'WEAK_MEMBER_PASSWORD', message: 'Üye parolası en az 8 karakter olmalıdır.' });
+        return;
+      }
 
       const result = await runInAtomicTransaction(() => {
         const normalizedEmail = String(email || '').trim().toLowerCase();
@@ -6066,7 +6072,7 @@ async function startServer() {
 
         if (skipInitialOrder) {
           recalculateAllCareers('MANUAL_ADMIN');
-          if (password && String(password).length >= 4) {
+          if (password) {
             memberCredentials.set(newMember.user_id, hashMemberPassword(String(password)));
           }
           return { newMember, tx: null };
@@ -6081,7 +6087,7 @@ async function startServer() {
           package_id: pkgKey,
           timestamp: nowIso,
         });
-        if (password && String(password).length >= 4) {
+        if (password) {
           memberCredentials.set(newMember.user_id, hashMemberPassword(String(password)));
         }
 

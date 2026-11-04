@@ -54,7 +54,6 @@ import { db, wipeAllLocalApplicationData, doc, setDoc } from '../lib/db';
 import { DataBackupRestoreModal } from './DataBackupRestoreModal';
 import { loginAdminWithMessage } from '../utils/adminSession';
 import {
-  ADMIN_EMAILS,
   ADMIN_PHONE,
   BANK_INFO,
   DEFAULT_MEMBERSHIP_PACKAGES,
@@ -177,8 +176,8 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
   onOpenSmartAccounting,
 }) => {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => sessionStorage.getItem(ADMIN_SESSION_KEY) === '1');
-  const [adminEmailInput, setAdminEmailInput] = useState<string>('psikologabdulkadirkan@gmail.com');
-  const [adminPasswordInput, setAdminPasswordInput] = useState<string>('Abdulkadir1983');
+  const [adminEmailInput, setAdminEmailInput] = useState<string>('');
+  const [adminPasswordInput, setAdminPasswordInput] = useState<string>('');
   const [loginError, setLoginError] = useState<string | null>(null);
 
   // Active Admin Subtab
@@ -929,8 +928,8 @@ const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
       return;
     }
 
-    if (manPassword.trim().length < 4) {
-      alert('Şifre en az 4 karakter olmalıdır.');
+    if (manPassword.trim().length < 8) {
+      alert('Şifre en az 8 karakter olmalıdır.');
       return;
     }
 
@@ -2116,7 +2115,7 @@ const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
                   required
                   value={adminEmailInput}
                   onChange={(e) => setAdminEmailInput(e.target.value)}
-                  placeholder="psikologabdulkadirkan@gmail.com"
+                  placeholder="Yönetici e-posta adresi"
                   className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-700 focus:border-emerald-500 text-xs text-slate-100"
                 />
               </div>
@@ -6721,10 +6720,10 @@ const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
                       <input
                         type="text"
                         required
-                        minLength={4}
+                        minLength={8}
                         value={manPassword}
                         onChange={(e) => setManPassword(e.target.value)}
-                        placeholder="En az 4 karakter (örn: 123456)"
+                        placeholder="En az 8 karakter"
                         className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-amber-300 font-mono font-bold text-xs outline-none focus:border-amber-500"
                       />
                     </div>

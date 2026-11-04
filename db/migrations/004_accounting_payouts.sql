@@ -1,3 +1,16 @@
+ALTER TABLE commission_logs
+  ADD COLUMN IF NOT EXISTS commission_id VARCHAR(128);
+
+UPDATE commission_logs
+SET commission_id = 'LEGACY-MIGRATION-COMMISSION-' || id::text
+WHERE commission_id IS NULL OR BTRIM(commission_id) = '';
+
+ALTER TABLE commission_logs
+  ALTER COLUMN commission_id SET NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS commission_logs_commission_id_key
+  ON commission_logs(commission_id);
+
 CREATE TABLE IF NOT EXISTS member_payout_profiles (
   beneficiary_user_id VARCHAR(64) PRIMARY KEY REFERENCES members(user_id) ON DELETE RESTRICT,
   tax_id_ciphertext BYTEA NOT NULL,

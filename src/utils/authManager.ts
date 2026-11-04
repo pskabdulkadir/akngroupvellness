@@ -21,6 +21,7 @@ import { getAdminToken, loginAdmin, loginAdminWithMessage } from './adminSession
 export const ADMIN_EMAILS = [
   'psikologabdulkadirkan@gmail.com',
 ];
+const ADMIN_LOGIN_EMAIL = (import.meta.env.VITE_ADMIN_EMAIL || ADMIN_EMAILS[0]).trim().toLowerCase();
 export let ADMIN_PHONE = '+90 542 578 37 48';
 export let ADMIN_PHONE_CLEAN = '905425783748';
 
@@ -875,12 +876,12 @@ export async function registerMember(
       return { success: false, message: 'Lütfen tüm alanları doldurunuz.' };
     }
 
-    if (password.length < 4) {
-      return { success: false, message: 'Şifre en az 4 karakter olmalıdır.' };
+    if (password.length < 8) {
+      return { success: false, message: 'Şifre en az 8 karakter olmalıdır.' };
     }
 
     // If registering with admin email -> automatically elevate to Admin
-    if (ADMIN_EMAILS.includes(cleanEmail) && (await loginAdmin(cleanEmail, password))) {
+    if (cleanEmail === ADMIN_LOGIN_EMAIL && (await loginAdmin(cleanEmail, password))) {
       const adminCode = 'AURA-BAYI-AKN01';
       const adminUser: UserMember = {
         uid: 'ADMIN-AKN-01',
@@ -1360,8 +1361,8 @@ export async function adminCreateDealerDirectly(data: {
       return { success: false, message: 'Lütfen Ad Soyad, E-posta, Şifre, Telefon ve Firma Adı alanlarını doldurunuz.' };
     }
 
-    if (cleanPassword.length < 4) {
-      return { success: false, message: 'Şifre en az 4 karakter olmalıdır.' };
+    if (cleanPassword.length < 8) {
+      return { success: false, message: 'Şifre en az 8 karakter olmalıdır.' };
     }
 
     const localList = getLocalMembersDirectory();
@@ -1642,8 +1643,12 @@ export async function updateMemberProfile(
       phone: cleanPhone,
     };
 
-    if (data.newPassword && data.newPassword.trim().length >= 4) {
-      updatedUser.passwordHash = hashPassword(data.newPassword.trim());
+    const newPassword = data.newPassword?.trim();
+    if (newPassword && newPassword.length < 8) {
+      return { success: false, message: 'Yeni parola en az 8 karakter olmalıdır.' };
+    }
+    if (newPassword) {
+      updatedUser.passwordHash = hashPassword(newPassword);
     }
 
     // Save to Local directory & active session
@@ -1791,14 +1796,10 @@ export async function loginMember(
     }
 
     // 1. Direct Admin Login Check (admin email / password)
-    if (ADMIN_EMAILS.includes(cleanEmail)) {
-      const adminLogin = await loginAdminWithMessage(cleanEmail, cleanPassword);
-      if (!adminLogin.success) {
-        return {
-          success: false,
-          message: adminLogin.message || 'Yönetici girişi başarısız oldu.',
-        };
-      }
+    const adminLogin = cleanEmail === ADMIN_LOGIN_EMAIL
+      ? await loginAdminWithMessage(cleanEmail, cleanPassword)
+      : { success: false };
+    if (adminLogin.success) {
       const adminCode = 'AURA-BAYI-AKN01';
       const adminUser: UserMember = {
         uid: 'ADMIN-AKN-01',
@@ -2131,7 +2132,7 @@ export function checkMemberAccess(user: UserMember | null): {
   }
 
   // Super-admin user role
-  if (user.role === 'admin' || user.uid === 'ADMIN-AKN-01' || ADMIN_EMAILS.includes(user.email)) {
+  if (user.role === 'admin' || user.uid === 'ADMIN-AKN-01' || user.email.toLowerCase() === ADMIN_LOGIN_EMAIL) {
     return {
       isLoggedIn: true,
       isAdmin: true,

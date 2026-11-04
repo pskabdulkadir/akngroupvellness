@@ -19,6 +19,7 @@ import {
   Calculator, 
   Home, 
   Moon,
+  ShieldAlert,
   Sun
 } from 'lucide-react';
 
@@ -190,10 +191,7 @@ export default function App() {
 
         <footer className="w-full border-t border-slate-200/60 dark:border-slate-800/60 px-6 py-8">
           <div className="mx-auto max-w-5xl space-y-5">
-            <section aria-labelledby="welcome-legal-title" className="space-y-3">
-              <h2 id="welcome-legal-title" className="text-sm font-bold text-slate-700 dark:text-slate-200">
-                Sanal POS ve banka incelemesi için sözleşmeler ve bilgilendirmeler
-              </h2>
+            <section aria-label="Yasal sözleşme bağlantıları">
               <nav aria-label="Yasal sözleşmeler" className="flex flex-wrap gap-x-5 gap-y-2 text-xs">
                 <button onClick={() => openLegalContract('preInfo')} className="text-blue-700 underline underline-offset-2 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-200">Ön Bilgilendirme Formu</button>
                 <button onClick={() => openLegalContract('distanceSale')} className="text-blue-700 underline underline-offset-2 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-200">Mesafeli Satış Sözleşmesi</button>
@@ -204,11 +202,41 @@ export default function App() {
               </nav>
             </section>
 
-            <section aria-labelledby="welcome-health-notice" className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">
-              <h2 id="welcome-health-notice" className="text-xs font-bold">Önemli sağlık bilgilendirmesi</h2>
-              <p className="mt-1 text-xs leading-relaxed">
-                AKN Wellness uygulaması sağlık hizmeti, tıbbi cihaz veya tedavi yöntemi değildir; içerikleri tıbbi teşhis, tedavi ya da reçete yerine geçmez ve hastalıkları tedavi etme amacı taşımaz. Sağlık sorularınız için yetkili bir sağlık profesyoneline başvurun.
-              </p>
+            <section
+              aria-labelledby="welcome-health-notice"
+              className={`relative overflow-hidden rounded-2xl border p-5 sm:p-6 ${
+                isDarkMode
+                  ? 'border-amber-400/20 bg-gradient-to-br from-amber-950/70 via-slate-900 to-slate-900 text-amber-50 shadow-lg shadow-black/10'
+                  : 'border-amber-200 bg-gradient-to-br from-amber-50 via-white to-orange-50 text-slate-800 shadow-lg shadow-amber-900/5'
+              }`}
+            >
+              <div className="flex items-start gap-4">
+                <div className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl ${
+                  isDarkMode ? 'bg-amber-400/10 text-amber-300' : 'bg-amber-100 text-amber-700'
+                }`}>
+                  <ShieldAlert className="h-5 w-5" aria-hidden="true" />
+                </div>
+                <div className="min-w-0">
+                  <h2 id="welcome-health-notice" className="text-sm font-bold sm:text-base">
+                    Önemli Bilgilendirme ve Yasal Uyarı
+                  </h2>
+                  <p className={`mt-2 text-xs leading-relaxed sm:text-sm ${
+                    isDarkMode ? 'text-slate-300' : 'text-slate-600'
+                  }`}>
+                    AKN Wellness bir sağlık hizmeti sunucusu, tıbbi cihaz veya tedavi yöntemi değildir; sunulan içerikler yalnızca genel bilgilendirme ve kişisel gelişim amaçlıdır.
+                  </p>
+                  <p className={`mt-2 text-xs leading-relaxed sm:text-sm ${
+                    isDarkMode ? 'text-slate-300' : 'text-slate-600'
+                  }`}>
+                    Bu platformdaki hiçbir ifade tıbbi tanı koyma, tedavi etme veya bir sağlık sorununu önleme amacı taşımaz.
+                  </p>
+                  <p className={`mt-3 border-l-2 pl-3 text-xs font-medium leading-relaxed sm:text-sm ${
+                    isDarkMode ? 'border-amber-400/60 text-amber-100' : 'border-amber-500 text-amber-900'
+                  }`}>
+                    Herhangi bir sağlık sorununuz için lütfen uzman bir sağlık profesyoneline başvurunuz.
+                  </p>
+                </div>
+              </div>
             </section>
 
             <p className="text-center text-xs text-slate-400 dark:text-slate-600">
