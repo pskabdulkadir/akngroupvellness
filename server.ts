@@ -180,6 +180,70 @@ let ethicsGuidelinesContent = DEFAULT_ETHICS_GUIDELINES_CONTENT;
 const ethicsGuidelinesClients = new Set<express.Response>();
 let members: MonolineMember[] = [];
 const memberCredentials = new Map<string, { salt: string; hash: string }>();
+
+function memberRegistryEncryptionKey(): Buffer {
+  const configuredKey = accountingPiiKey();
+  if (configuredKey) return configuredKey;
+  return createHash('sha256')
+    .update('monoline-member-registry:')
+    .update(process.env.ADMIN_JWT_SECRET || '')
+    .digest();
+}
+
+async function persistMemberRegistry(): Promise<void> {
+  const key = memberRegistryEncryptionKey();
+  await withTransaction(async (client) => {
+    for (const member of members) {
+      const credentials = memberCredentials.get(member.user_id) || null;
+      await client.query(
+        `INSERT INTO monoline_member_registry (user_id, global_line_id, archived_at, member_data_ciphertext, credential_ciphertext, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())
+         ON CONFLICT (user_id) DO UPDATE SET
+           global_line_id = EXCLUDED.global_line_id,
+           archived_at = EXCLUDED.archived_at,
+           member_data_ciphertext = EXCLUDED.member_data_ciphertext,
+           credential_ciphertext = EXCLUDED.credential_ciphertext,
+           updated_at = NOW()`,
+        [
+          member.user_id,
+          member.global_line_id,
+          member.archived_at || null,
+          encryptAccountingPii(member, key),
+          credentials ? encryptAccountingPii(credentials, key) : null,
+        ]
+      );
+    }
+  });
+}
+
+async function readMemberRegistry(): Promise<MonolineMember[]> {
+  const key = memberRegistryEncryptionKey();
+  const result = await getPostgresPool().query(
+    'SELECT member_data_ciphertext, credential_ciphertext FROM monoline_member_registry ORDER BY global_line_id'
+  );
+  return result.rows.map((row: any) => {
+    const member = decryptAccountingPii(Buffer.from(row.member_data_ciphertext), key) as MonolineMember;
+    if (row.credential_ciphertext) {
+      memberCredentials.set(member.user_id, decryptAccountingPii(Buffer.from(row.credential_ciphertext), key));
+    }
+    return member;
+  });
+}
+
+async function loadMemberRegistry(): Promise<void> {
+  const storedMembers = await readMemberRegistry();
+  if (storedMembers.length) {
+    members = storedMembers;
+  } else {
+    await persistMemberRegistry();
+  }
+}
+
+async function refreshMemberRegistry(): Promise<void> {
+  const storedMembers = await readMemberRegistry();
+  if (storedMembers.length) members = storedMembers;
+}
+
 // Once a credit change happens on the server, Frekans sync must not overwrite that balance with a stale copy.
 const creditsOwnedByServer = new Set<string>();
 let careerTiers: CareerTier[] = structuredClone(INITIAL_CAREER_TIERS);
@@ -4271,6 +4335,11 @@ const processedEventIdempotencyKeys = new Set<string>();
 async function startServer() {
   validateRuntimeEnvironment();
   await runDatabaseMigrations();
+  try {
+    await loadMemberRegistry();
+  } catch (err) {
+    console.error('[PostgreSQL] Üye dizini yüklenemedi:', err);
+  }
   const app = express();
   app.use(express.json({ limit: '50mb' }));
 
@@ -5662,7 +5731,7 @@ async function startServer() {
         resetBeforeSync = false,
       } = req.body || {};
 
-      await runInAtomicTransaction(() => {
+      await runInAtomicTransaction(async () => {
         if (resetBeforeSync) {
           resetToCleanSlate(true);
         }
@@ -5754,12 +5823,14 @@ async function startServer() {
               description: `🎁 İlk Bayi Kaydı Hoşgeldin Bonusu: ${existing.full_name} hesabına bir defaya mahsus 32+32 (Toplam ${WELCOME_BONUS_TOTAL_CREDITS}) Seans Kredisi otomatik tanımlandı.`,
             });
           } else {
-            if (fm.fullName) existing.full_name = String(fm.fullName).trim();
-            if (email) existing.email = email;
-            if (fm.phone) existing.phone = String(fm.phone).trim();
-            if (fm.city) existing.city = String(fm.city).trim();
-            if (fm.referralCode) {
-              existing.ref_code = String(fm.referralCode).trim().toUpperCase();
+            if (!existing.admin_profile_override) {
+              if (fm.fullName) existing.full_name = String(fm.fullName).trim();
+              if (email) existing.email = email;
+              if (fm.phone) existing.phone = String(fm.phone).trim();
+              if (fm.city) existing.city = String(fm.city).trim();
+              if (fm.referralCode) {
+                existing.ref_code = String(fm.referralCode).trim().toUpperCase();
+              }
             }
             if (
               typeof fm.creditsBalance === 'number' &&
@@ -5780,7 +5851,7 @@ async function startServer() {
         for (const fm of incomingMembers) {
           if (!fm || !fm.uid) continue;
           const member = members.find((m) => m.user_id === String(fm.uid).trim());
-          if (!member || newlyPlacedMemberIds.has(member.user_id)) continue;
+          if (!member || newlyPlacedMemberIds.has(member.user_id) || member.admin_sponsor_override) continue;
 
           const refByCode = String(fm.referredByCode || '').trim().toUpperCase();
           const resId = String(fm.resellerId || '').trim();
@@ -5871,6 +5942,7 @@ async function startServer() {
         }
 
         recalculateAllCareers('POST_COMMISSION_EVENT');
+        await persistMemberRegistry();
       });
 
       res.json({
@@ -6095,6 +6167,7 @@ async function startServer() {
 
         return { newMember, tx };
       });
+      await persistMemberRegistry();
 
       res.status(201).json({
         status: 'success',
@@ -6337,7 +6410,111 @@ async function startServer() {
     });
   });
 
-  app.put('/api/v1/admin/members/:userId', requireAdminJwt, (req, res) => {
+  app.get('/api/v1/admin/member-directory', requireAdminJwt, async (_req, res) => {
+    try {
+      const storedMembers = await readMemberRegistry();
+      if (storedMembers.length) {
+        members = storedMembers;
+        res.json({ members: storedMembers.map((member) => ({
+          user_id: member.user_id,
+          global_line_id: member.global_line_id,
+          ref_code: member.ref_code,
+          full_name: member.full_name,
+          email: member.email,
+          phone: member.phone,
+          city: member.city,
+          sponsor_id: member.sponsor_id,
+          is_active: member.is_active,
+          is_locked: member.is_locked,
+          archived_at: member.archived_at || null,
+          archived_previous_is_active: member.archived_previous_is_active,
+          archived_previous_is_locked: member.archived_previous_is_locked,
+        })) });
+        return;
+      }
+      await persistMemberRegistry();
+      res.json({ members: members.slice().sort((a, b) => a.global_line_id - b.global_line_id).map((member) => ({
+        user_id: member.user_id,
+        global_line_id: member.global_line_id,
+        ref_code: member.ref_code,
+        full_name: member.full_name,
+        email: member.email,
+        phone: member.phone,
+        city: member.city,
+        sponsor_id: member.sponsor_id,
+        is_active: member.is_active,
+        is_locked: member.is_locked,
+        archived_at: member.archived_at || null,
+        archived_previous_is_active: member.archived_previous_is_active,
+        archived_previous_is_locked: member.archived_previous_is_locked,
+      })) });
+    } catch {
+      res.status(503).json({ status: 'error', message: 'Üye dizini veritabanından okunamadı.' });
+    }
+  });
+
+  app.patch('/api/v1/admin/members/:userId/archive', requireAdminJwt, async (req, res) => {
+    try {
+      await refreshMemberRegistry();
+    } catch {
+      res.status(503).json({ status: 'error', message: 'Üye dizini veritabanından yenilenemedi.' });
+      return;
+    }
+    const member = members.find((entry) => entry.user_id === req.params.userId);
+    if (!member) {
+      res.status(404).json({ status: 'error', message: 'Üye bulunamadı.' });
+      return;
+    }
+    if (member.user_id === 'USR-ADMIN') {
+      res.status(400).json({ status: 'error', message: 'Sistem kökü arşivlenemez.' });
+      return;
+    }
+    if (typeof req.body?.archived !== 'boolean') {
+      res.status(400).json({ status: 'error', message: 'Arşiv durumu zorunludur.' });
+      return;
+    }
+
+    const previousMembers = structuredClone(members);
+    if (req.body.archived && !member.archived_at) {
+      member.archived_previous_is_active = member.is_active;
+      member.archived_previous_is_locked = member.is_locked;
+      member.archived_at = new Date().toISOString();
+      member.is_active = false;
+      member.is_locked = true;
+    } else if (!req.body.archived && member.archived_at) {
+      member.archived_at = null;
+      member.is_active = member.archived_previous_is_active ?? true;
+      member.is_locked = member.archived_previous_is_locked ?? false;
+      delete member.archived_previous_is_active;
+      delete member.archived_previous_is_locked;
+    }
+
+    recalculateAllCareers('MANUAL_ADMIN');
+    try {
+      await persistMemberRegistry();
+      res.json({
+        status: 'success',
+        member: {
+          user_id: member.user_id,
+          is_active: member.is_active,
+          is_locked: member.is_locked,
+          archived_at: member.archived_at,
+        },
+        state: buildStateResponse(true),
+      });
+    } catch {
+      members = previousMembers;
+      res.status(503).json({ status: 'error', message: 'Arşiv işlemi kalıcı olarak kaydedilemedi.' });
+    }
+  });
+
+  app.put('/api/v1/admin/members/:userId', requireAdminJwt, async (req, res) => {
+    try {
+      await refreshMemberRegistry();
+    } catch {
+      res.status(503).json({ status: 'error', message: 'Üye dizini veritabanından yenilenemedi.' });
+      return;
+    }
     const member = members.find((m) => m.user_id === req.params.userId);
     if (!member) {
       res.status(404).json({ status: 'error', message: 'Üye bulunamadı.' });
@@ -6360,8 +6537,67 @@ async function startServer() {
       right_leg_volume,
       personal_volume,
       group_volume,
+      email,
+      phone,
     } = req.body;
 
+    const normalizedEmail = email === undefined ? undefined : String(email).trim().toLowerCase();
+    if (normalizedEmail && members.some((other) => other.user_id !== member.user_id && other.email.toLowerCase() === normalizedEmail)) {
+      res.status(409).json({ status: 'error', message: 'Bu e-posta adresi başka bir üyeye kayıtlı.' });
+      return;
+    }
+
+    let nextSponsor: MonolineMember | null | undefined;
+    if (sponsor_id !== undefined) {
+      const sponsorValue = String(sponsor_id || '').trim();
+      if (!sponsorValue) {
+        nextSponsor = member.user_id === 'USR-ADMIN'
+          ? null
+          : members.find((other) => other.user_id === 'USR-ADMIN');
+        if (member.user_id !== 'USR-ADMIN' && !nextSponsor) {
+          res.status(400).json({ status: 'error', message: 'Sistem yöneticisi sponsoru bulunamadı.' });
+          return;
+        }
+      } else {
+        nextSponsor = members.find((other) =>
+          other.user_id === sponsorValue || other.ref_code.toUpperCase() === sponsorValue.toUpperCase()
+        );
+        if (!nextSponsor || nextSponsor.archived_at || nextSponsor.user_id === member.user_id) {
+          res.status(400).json({ status: 'error', message: 'Geçerli ve aktif bir sponsor seçiniz.' });
+          return;
+        }
+        if (member.user_id === 'USR-ADMIN') {
+          res.status(400).json({ status: 'error', message: 'Sistem kökünün sponsoru değiştirilemez.' });
+          return;
+        }
+        const visited = new Set<string>();
+        let cursor: MonolineMember | undefined = nextSponsor;
+        while (cursor && !visited.has(cursor.user_id)) {
+          if (cursor.user_id === member.user_id) {
+            res.status(400).json({ status: 'error', message: 'Sponsor değişikliği döngü oluşturamaz.' });
+            return;
+          }
+          visited.add(cursor.user_id);
+          cursor = cursor.sponsor_id ? members.find((other) => other.user_id === cursor!.sponsor_id) : undefined;
+        }
+        if (cursor) {
+          res.status(400).json({ status: 'error', message: 'Mevcut sponsor zinciri döngü içeriyor.' });
+          return;
+        }
+      }
+    }
+
+    if (member.archived_at && is_active === true) {
+      res.status(400).json({ status: 'error', message: 'Arşivdeki üye önce arşivden çıkarılmalıdır.' });
+      return;
+    }
+    const nextRefCode = ref_code && String(ref_code).trim().toUpperCase();
+    if (nextRefCode && members.some((other) => other.user_id !== member.user_id && other.ref_code.toUpperCase() === nextRefCode)) {
+      res.status(409).json({ status: 'error', message: 'Bu bayi kodu başka bir üyeye kayıtlı.' });
+      return;
+    }
+
+    const previousMembers = structuredClone(members);
     const prevExp = member.activity_expires_at;
     if (typeof is_active === 'boolean') {
       member.is_active = is_active;
@@ -6380,9 +6616,14 @@ async function startServer() {
       member.session_credits = Math.round(session_credits);
     }
     if (full_name && String(full_name).trim()) member.full_name = String(full_name).trim();
+    if (normalizedEmail !== undefined) member.email = normalizedEmail;
+    if (phone !== undefined) member.phone = String(phone).trim();
     if (city && String(city).trim()) member.city = String(city).trim();
     if (ref_code && String(ref_code).trim()) {
       member.ref_code = String(ref_code).trim().toUpperCase();
+    }
+    if (full_name !== undefined || email !== undefined || phone !== undefined || city !== undefined || ref_code !== undefined) {
+      member.admin_profile_override = true;
     }
     if (manual_career_override !== undefined) {
       member.manual_career_override =
@@ -6390,15 +6631,10 @@ async function startServer() {
           ? null
           : Number(manual_career_override);
     }
-    if (sponsor_id !== undefined && sponsor_id !== member.user_id) {
-      if (sponsor_id === '' || sponsor_id === null) {
-        member.sponsor_id = null;
-        member.sponsor_db_id = null;
-      } else {
-        const sp = members.find((m) => m.user_id === sponsor_id);
-        member.sponsor_id = sp ? sp.user_id : null;
-        member.sponsor_db_id = sp ? sp.id : null;
-      }
+    if (nextSponsor !== undefined) {
+      member.sponsor_id = nextSponsor?.user_id || null;
+      member.sponsor_db_id = nextSponsor?.id || null;
+      member.admin_sponsor_override = true;
     }
 
     if (assigned_leg) {
@@ -6450,53 +6686,54 @@ async function startServer() {
 
     recalculateAllCareers('MANUAL_ADMIN');
 
-    res.json({
-      status: 'success',
-      message: `${member.full_name} bayi yetki, sponsor ve Monoline sıra (#${member.global_line_id}) ayarları güncellendi.`,
-      state: buildStateResponse(),
-    });
-  });
-
-  app.delete('/api/v1/admin/members/:userId', requireAdminJwt, (req, res) => {
-    const idx = members.findIndex((m) => m.user_id === req.params.userId);
-    if (idx === -1) {
-      res.status(404).json({ status: 'error', message: 'Silinecek bayi/üye bulunamadı.' });
+    try {
+      await persistMemberRegistry();
+    } catch {
+      members = previousMembers;
+      res.status(503).json({ status: 'error', message: 'Üye değişikliği kalıcı olarak kaydedilemedi.' });
       return;
     }
 
-    const removed = members[idx];
-    const fallbackSponsor = removed.sponsor_id
-      ? members.find((m) => m.user_id === removed.sponsor_id && m.user_id !== removed.user_id)
-      : members.find((m) => m.user_id !== removed.user_id);
-
-    members.splice(idx, 1);
-
-    // Reassign downline members whose sponsor was the deleted member
-    for (const m of members) {
-      if (m.sponsor_id === removed.user_id) {
-        if (fallbackSponsor && fallbackSponsor.user_id !== m.user_id) {
-          m.sponsor_id = fallbackSponsor.user_id;
-          m.sponsor_db_id = fallbackSponsor.id;
-        } else {
-          m.sponsor_id = null;
-          m.sponsor_db_id = null;
-        }
-      }
-    }
-
-    // Re-sequence Monoline global_line_id without gaps
-    const ordered = [...members].sort((a, b) => a.global_line_id - b.global_line_id);
-    ordered.forEach((m, i) => {
-      m.global_line_id = i + 1;
-    });
-
-    recalculateAllCareers('MANUAL_ADMIN');
-
     res.json({
       status: 'success',
-      message: `${removed.full_name} (${removed.user_id}) sistemden silindi ve Monoline tek hat sıralaması (1..${members.length}) yeniden düzenlendi.`,
-      state: buildStateResponse(),
+      message: `${member.full_name} bayi yetki, sponsor ve Monoline sıra (#${member.global_line_id}) ayarları güncellendi.`,
+      state: buildStateResponse(true),
     });
+  });
+
+  app.delete('/api/v1/admin/members/:userId', requireAdminJwt, async (req, res) => {
+    try {
+      await refreshMemberRegistry();
+    } catch {
+      res.status(503).json({ status: 'error', message: 'Üye dizini veritabanından yenilenemedi.' });
+      return;
+    }
+    const member = members.find((entry) => entry.user_id === req.params.userId);
+    if (!member) {
+      res.status(404).json({ status: 'error', message: 'Arşivlenecek üye bulunamadı.' });
+      return;
+    }
+    if (member.user_id === 'USR-ADMIN') {
+      res.status(400).json({ status: 'error', message: 'Sistem kökü arşivlenemez.' });
+      return;
+    }
+
+    const previousMembers = structuredClone(members);
+    if (!member.archived_at) {
+      member.archived_previous_is_active = member.is_active;
+      member.archived_previous_is_locked = member.is_locked;
+      member.archived_at = new Date().toISOString();
+      member.is_active = false;
+      member.is_locked = true;
+    }
+    recalculateAllCareers('MANUAL_ADMIN');
+    try {
+      await persistMemberRegistry();
+      res.json({ status: 'success', message: `${member.full_name} arşivlendi; işlem geçmişi korundu.`, member, state: buildStateResponse(true) });
+    } catch {
+      members = previousMembers;
+      res.status(503).json({ status: 'error', message: 'Arşiv işlemi kalıcı olarak kaydedilemedi.' });
+    }
   });
 
   // Instant Admin Career Bonus & Custom Wallet Bonus Payout Endpoint
@@ -9190,6 +9427,7 @@ async function startServer() {
 
         return { newMember, tx, p2pRecord, walletTransaction };
       });
+      await persistMemberRegistry();
 
       res.status(201).json({
         status: 'success',
@@ -9548,8 +9786,15 @@ async function startServer() {
     });
   });
 
-  app.post('/api/v1/reset', requireAdminJwt, (_req, res) => {
+  app.post('/api/v1/reset', requireAdminJwt, async (_req, res) => {
     resetToCleanSlate(true);
+    try {
+      await getPostgresPool().query('DELETE FROM monoline_member_registry');
+      await persistMemberRegistry();
+    } catch {
+      res.status(503).json({ status: 'error', message: 'Sıfırlama tamamlandı ancak üye dizini kalıcı olarak güncellenemedi.' });
+      return;
+    }
     res.json({
       status: 'success',
       message:

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { AlertTriangle, BarChart3, Camera, ChevronDown, ChevronUp, Database, RefreshCw, RotateCcw, X } from 'lucide-react';
+import { AlertTriangle, Archive, BarChart3, Camera, ChevronDown, ChevronUp, Database, RefreshCw, RotateCcw, X } from 'lucide-react';
 import { AdminConsoleView } from './AdminConsoleView';
 import { CareerMatrixView } from './CareerMatrixView';
 import { CommissionEngineView } from './CommissionEngineView';
@@ -679,23 +679,22 @@ export const MonolineMlmPortalModal: React.FC<MonolineMlmPortalModalProps> = ({
   };
 
   const handleAdminDeleteMember = async (userId: string) => {
-    if (!window.confirm('Bu bayiyi/üyeyi sistemden silmek istediğinizden emin misiniz? Alt ekibi ve Monoline sıra numaraları otomatik olarak yeniden düzenlenecektir.')) {
+    if (!window.confirm('Bu bayi/üyeyi arşivlemek istiyor musunuz? Erişimi kapatılır; sponsor ve finansal geçmişi korunur.')) {
       return;
     }
     setIsSubmitting(true);
     try {
-      const res = await fetch(`/api/v1/admin/members/${userId}`, {
-        method: 'DELETE',
-        headers: {
-
-        },
+      const res = await fetch(`/api/v1/admin/members/${encodeURIComponent(userId)}/archive`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ archived: true }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.message || 'Üye silinemedi.');
+      if (!res.ok) throw new Error(data.message || 'Üye arşivlenemedi.');
       if (data.state) {
         applyServerState(data.state);
       }
-      showNotice('success', data.message || 'Bayi sistemden silindi.');
+      showNotice('success', data.message || 'Bayi arşivlendi; işlem geçmişi korundu.');
     } catch (err: any) {
       showNotice('error', err?.message || 'Hata oluştu.');
     } finally {

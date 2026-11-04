@@ -24,6 +24,7 @@ import {
   ShieldCheck,
   Sliders,
   Timer,
+  Archive,
   Trash2,
   Unlock,
   Upload,
@@ -4465,11 +4466,11 @@ export const AdminConsoleView: React.FC<AdminConsoleViewProps> = ({
                               type="button"
                               disabled={isSubmitting}
                               onClick={() => onAdminDeleteMember(m.user_id)}
-                              title="Bayiyi Sistemden Sil ve Monoline Sırasını Güncelle"
+                              title="Bayiyi işlem geçmişini koruyarak arşivle"
                               className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-red-600 hover:bg-red-700 text-white text-[11px] font-bold rounded-lg cursor-pointer disabled:opacity-40"
                             >
-                              <Trash2 className="w-3 h-3" />
-                              <span>Sil</span>
+                              <Archive className="w-3 h-3" />
+                              <span>Arşivle</span>
                             </button>
                           )}
                         </div>

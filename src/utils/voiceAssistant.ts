@@ -817,7 +817,9 @@ class VoiceAssistantEngine {
       };
 
       utterance.onerror = (err) => {
-        console.warn('Speech synthesis utterance notice:', err);
+        if (err.error !== 'canceled' && err.error !== 'interrupted') {
+          console.warn('Speech synthesis utterance notice:', err);
+        }
         cleanupUtterance();
         if (queueId === this.currentPlayQueueId) {
           this.playChunkQueue(chunks, index + 1, queueId);

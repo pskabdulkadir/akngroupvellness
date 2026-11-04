@@ -528,6 +528,7 @@ export interface UserMember {
   dealerDetails?: DealerDetails;
   creditsBalance?: number; // Available scan / session credits pool
   dealerPackageId?: string; // e.g. 'bronze-dealer', 'silver-dealer', 'gold-dealer'
+  archivedAt?: string | null;
   welcomeBonusGranted?: boolean;
   welcomeBonusCredits?: number;
   welcomeBonusBreakdown?: string;
@@ -2147,6 +2148,21 @@ export function checkMemberAccess(user: UserMember | null): {
     };
   }
 
+  if (user.archivedAt) {
+    return {
+      isLoggedIn: true,
+      isAdmin: false,
+      isAllowed: false,
+      isExpired: false,
+      isPending: true,
+      isDemo: false,
+      remainingDays: 0,
+      remainingSeconds: 0,
+      remainingText: 'Hesap arşivlenmiş',
+      statusBadge: 'ARŞİVLENDİ',
+    };
+  }
+
   // 2. Dealer / Reseller User Access
   const isDealerAccount = user.role === 'dealer' || 
                           user.dealerStatus === 'approved' || 
@@ -2437,39 +2453,34 @@ export async function adminSetMemberAccess(
   }
 }
 
-/**
- * Admin: Delete member record completely
- */
-export async function adminDeleteMember(uid: string): Promise<boolean> {
+export async function adminSetMemberArchived(uid: string, archived: boolean): Promise<boolean> {
   try {
-    removeFromLocalMembersDirectory(uid);
+    const token = getAdminToken();
+    const response = await fetch(`/api/v1/admin/members/${encodeURIComponent(uid)}/archive`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ archived }),
+    });
+    if (!response.ok) return false;
 
-    // If the currently active session in browser was this user, clear it
-    if (typeof window !== 'undefined') {
-      try {
-        const raw = localStorage.getItem(STORAGE_SESSION_KEY);
-        if (raw) {
-          const activeUser = JSON.parse(raw);
-          if (activeUser && activeUser.uid === uid) {
-            localStorage.removeItem(STORAGE_SESSION_KEY);
-          }
-        }
-      } catch {
-        // non-blocking
+    const data = await response.json();
+    const member = getLocalMembersDirectory().find((entry) => entry.uid === uid);
+    if (member) {
+      const updated = {
+        ...member,
+        isAllowed: archived ? false : Boolean(data.member?.is_active),
+        archivedAt: data.member?.archived_at || null,
+      };
+      saveToLocalMembersDirectory(updated);
+      await setDoc(doc(db, 'users', uid), updated, { merge: true });
+      const active = getActiveMemberSession();
+      if (active?.uid === uid) {
+        localStorage.setItem(STORAGE_SESSION_KEY, JSON.stringify(updated));
+        window.dispatchEvent(new CustomEvent('aurabio_session_updated', { detail: updated }));
       }
-    }
-
-    try {
-      const docRef = doc(db, 'users', uid);
-      await deleteDoc(docRef);
-    } catch (fsErr) {
-      console.warn('Admin delete member Firestore notice:', fsErr);
-    }
-
-    try {
-      await fetch(`/api/v1/admin/members/${uid}`, { method: 'DELETE' });
-    } catch (srvErr) {
-      console.debug('Server delete member notice:', srvErr);
     }
 
     if (typeof window !== 'undefined') {
@@ -2477,10 +2488,9 @@ export async function adminDeleteMember(uid: string): Promise<boolean> {
       window.dispatchEvent(new CustomEvent('aurabio_resellers_updated'));
       window.dispatchEvent(new CustomEvent('monoline_webhook_triggered'));
     }
-
     return true;
   } catch (err) {
-    console.error('Admin delete member error:', err);
+    console.error('Admin archive member error:', err);
     return false;
   }
 }

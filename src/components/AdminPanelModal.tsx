@@ -4,7 +4,8 @@ import {
   ShieldCheck, 
   Search, 
   RefreshCw, 
-  Trash2, 
+  Trash2,
+  Archive,
   CheckCircle2, 
   XCircle, 
   Send, 
@@ -66,7 +67,7 @@ import {
   UserMember, 
   adminGetAllMembers, 
   adminSetMemberAccess, 
-  adminDeleteMember,
+  adminSetMemberArchived,
   checkMemberAccess,
   adminApproveDealer,
   adminRejectDealer,
@@ -103,7 +104,7 @@ import {
   adminResetDealerPackages,
   getAllResellers, 
   adminSaveReseller, 
-  adminDeleteReseller, 
+  adminSetResellerArchived, 
   getAllCommissionsAdmin, 
   adminUpdateCommissionStatus,
   adminAdjustDealerCredits,
@@ -135,6 +136,7 @@ import { SiteContentAdminTab } from './SiteContentAdminTab';
 import { EthicsGuidelinesAdminTab } from './EthicsGuidelinesAdminTab';
 import { MonolineMlmPortalModal } from './MonolineMlmPortalModal';
 import { SharedDocumentsPanel } from './SharedDocumentsPanel';
+import { AdminMemberDirectory } from './AdminMemberDirectory';
 import { 
   downloadInvoicePDF, 
   shareInvoiceViaWhatsAppWithPDF 
@@ -155,9 +157,10 @@ interface AdminPanelModalProps {
 
 export const ADMIN_SESSION_KEY = 'aurabio_admin_session_v1';
 export const ADMIN_TAB_KEY = 'aurabio_admin_tab_v1';
-const ADMIN_TABS = ['members', 'packages', 'resellers', 'dealers', 'devices', 'invoices', 'campaigns', 'scans', 'monoline_sql', 'site_content', 'ethics_guidelines'] as const;
+const ADMIN_TABS = ['member_directory', 'members', 'packages', 'resellers', 'dealers', 'devices', 'invoices', 'campaigns', 'scans', 'monoline_sql', 'site_content', 'ethics_guidelines'] as const;
 type AdminTab = typeof ADMIN_TABS[number];
 const ADMIN_MODULE_LINKS: { id: Exclude<AdminTab, 'monoline_sql'>; label: string; icon: React.ComponentType<{ className?: string }>; color: string }[] = [
+  { id: 'member_directory', label: 'Üye & Bayi Yönetim Merkezi', icon: Users, color: 'emerald' },
   { id: 'members', label: 'Üye & Ödeme Onayları', icon: Users, color: 'emerald' },
   { id: 'packages', label: 'Dinamik Paket Yönetimi', icon: Package, color: 'teal' },
   { id: 'resellers', label: 'Bayi & Komisyon Yönetimi', icon: Building2, color: 'cyan' },
@@ -1227,9 +1230,10 @@ const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
     if (!resellerToDelete) return;
     setResellerSaveLoading(true);
     try {
-      const ok = await adminDeleteReseller(resellerToDelete.uid);
+      const memberArchived = await adminSetMemberArchived(resellerToDelete.uid, true);
+      const ok = memberArchived && await adminSetResellerArchived(resellerToDelete.uid, true);
       if (ok) {
-        setActionSuccessMsg(`"${resellerToDelete.resellerName}" bayisi silindi.`);
+        setActionSuccessMsg(`"${resellerToDelete.resellerName}" bayisi arşivlendi; işlem geçmişi korundu.`);
         setResellerToDelete(null);
         await loadResellersAndCommissions();
         setTimeout(() => setActionSuccessMsg(null), 3500);
@@ -1376,10 +1380,10 @@ const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
     try {
       const targetName = memberToDelete.fullName;
       const targetUid = memberToDelete.uid;
-      const ok = await adminDeleteMember(targetUid);
+      const ok = await adminSetMemberArchived(targetUid, true);
       if (ok) {
-        setMembers((prev) => prev.filter((m) => m.uid !== targetUid));
-        setActionSuccessMsg(`"${targetName}" adlı üye veritabanından kalıcı olarak silindi.`);
+        setMembers((prev) => prev.map((member) => member.uid === targetUid ? { ...member, isAllowed: false, archivedAt: new Date().toISOString() } : member));
+        setActionSuccessMsg(`"${targetName}" adlı üye arşivlendi; finansal geçmiş korundu.`);
         setMemberToDelete(null);
         if (onMemberUpdated) onMemberUpdated();
         setTimeout(() => setActionSuccessMsg(null), 4000);
@@ -1752,6 +1756,7 @@ const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
     member.dealerStatus !== 'rejected'
   ).length;
   const adminModuleCounts: Partial<Record<AdminTab, number>> = {
+    member_directory: members.length + resellers.length,
     members: members.length,
     packages: packages.length,
     resellers: resellers.length,
@@ -2263,6 +2268,8 @@ const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
               </div>
             )}
 
+            {adminTab === 'member_directory' && <AdminMemberDirectory />}
+
             {/* TAB 1: MEMBERS MANAGEMENT */}
             {adminTab === 'members' && (
               <div className="space-y-6">
@@ -2523,10 +2530,10 @@ const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
                               <button
                                 onClick={() => setMemberToDelete(member)}
                                 className="px-2.5 py-1.5 rounded-xl bg-rose-950/80 hover:bg-rose-900 text-rose-300 hover:text-rose-100 border border-rose-500/50 text-[11px] font-bold flex items-center gap-1.5 transition-all shadow-sm shadow-rose-950/40 cursor-pointer"
-                                title="Üyeyi Veritabanından Sil"
+                                title="Üyeyi işlem geçmişini koruyarak arşivle"
                               >
-                                <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-                                <span>Üyeyi Sil</span>
+                                <Archive className="w-3.5 h-3.5 text-rose-400" />
+                                <span>Üyeyi Arşivle</span>
                               </button>
                             </div>
                           </div>
@@ -2894,9 +2901,9 @@ const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
                                   <button
                                     onClick={() => setResellerToDelete(r)}
                                     className="p-2 rounded-xl bg-rose-950/60 hover:bg-rose-900 text-rose-300 hover:text-white transition-colors cursor-pointer"
-                                    title="Bayiyi Sil"
+                                    title="Bayiyi işlem geçmişini koruyarak arşivle"
                                   >
-                                    <Trash2 className="w-3.5 h-3.5" />
+                                    <Archive className="w-3.5 h-3.5" />
                                   </button>
                                 </div>
                               </div>
@@ -5525,10 +5532,10 @@ const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
                 </div>
                 <div>
                   <h3 className="text-base font-bold text-slate-100">
-                    Üyeyi Silmek İstiyor Musunuz?
+                    Üyeyi Arşivlemek İstiyor Musunuz?
                   </h3>
-                  <p className="text-xs text-rose-300/90 font-medium">
-                    Bu işlem geri alınamaz ve Supabase veritabanından kalıcı olarak siler.
+                  <p className="text-xs text-amber-300/90 font-medium">
+                    Üyelik pasifleştirilir; sponsor ve finansal işlem geçmişi korunur.
                   </p>
                 </div>
               </div>
@@ -5568,17 +5575,17 @@ const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
                   type="button"
                   disabled={isDeleting}
                   onClick={handleConfirmDelete}
-                  className="px-5 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold shadow-lg shadow-rose-950/70 flex items-center gap-2 transition-all cursor-pointer"
+                  className="px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-extrabold shadow-lg shadow-amber-950/70 flex items-center gap-2 transition-all cursor-pointer"
                 >
                   {isDeleting ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin" />
-                      <span>Siliniyor...</span>
+                      <span>Arşivleniyor...</span>
                     </>
                   ) : (
                     <>
-                      <Trash2 className="w-4 h-4" />
-                      <span>Evet, Kalıcı Olarak Sil</span>
+                      <Archive className="w-4 h-4" />
+                      <span>Evet, Arşivle</span>
                     </>
                   )}
                 </button>
@@ -6392,10 +6399,10 @@ const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
                 </div>
                 <div>
                   <h3 className="text-base font-bold text-slate-100">
-                    Bayiyi Silmek İstiyor Musunuz?
+                    Bayiyi Arşivlemek İstiyor Musunuz?
                   </h3>
-                  <p className="text-xs text-rose-300/90 font-medium">
-                    Bu bayinin kaydı ve referans bağlantısı silinecektir.
+                  <p className="text-xs text-amber-300/90 font-medium">
+                    Bayilik pasifleştirilir; sponsor bağlantısı ve finansal işlem geçmişi korunur.
                   </p>
                 </div>
               </div>
@@ -6434,8 +6441,8 @@ const [scanActionMsg, setScanActionMsg] = useState<string | null>(null);
                     </>
                   ) : (
                     <>
-                      <Trash2 className="w-4 h-4" />
-                      <span>Evet, Bayiyi Sil</span>
+                      <Archive className="w-4 h-4" />
+                      <span>Evet, Bayiyi Arşivle</span>
                     </>
                   )}
                 </button>

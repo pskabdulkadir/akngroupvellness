@@ -1114,6 +1114,11 @@ export interface MonolineMember {
   two_factor: TwoFactorAuthConfig;
   is_active: boolean; // SQL: users.is_active (Boolean, Default: true)
   is_locked: boolean;
+  archived_at?: string | null;
+  archived_previous_is_active?: boolean;
+  archived_previous_is_locked?: boolean;
+  admin_sponsor_override?: boolean;
+  admin_profile_override?: boolean;
   activity_expires_at: string; // SQL: users.activity_expires_at (Timestamp, 30 günlük süre sonu)
   welcome_bonus_granted?: boolean; // İlk bayi kaydında bir defaya mahsus 32+32 (64) hoşgeldin bonusu tanımlandı mı
   welcome_bonus_credits?: number; // Tanımlanan hoşgeldin bonusu kredi miktarı (32+32 = 64)

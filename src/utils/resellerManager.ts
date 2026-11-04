@@ -305,6 +305,8 @@ export interface Reseller {
   commissionRate?: number; // percentage e.g. 20 for 20%
   bankInfo: BankInfo;
   status: 'active' | 'pending' | 'suspended';
+  archivedAt?: string | null;
+  archivedPreviousStatus?: 'active' | 'pending' | 'suspended';
   totalEarnings: number; // total commission earned
   paidEarnings: number; // paid out by admin
   pendingEarnings: number; // waiting for payment
@@ -3021,36 +3023,43 @@ export async function adminSaveReseller(reseller: Reseller): Promise<boolean> {
   }
 }
 
-/**
- * Admin: Delete Reseller
- */
-export async function adminDeleteReseller(resellerId: string): Promise<boolean> {
+export async function adminSetResellerArchived(resellerId: string, archived: boolean): Promise<boolean> {
   try {
     const all = await getAllResellers();
-    const target = all.find(r => r.uid === resellerId);
-    const updated = all.filter(r => r.uid !== resellerId);
-    saveLocalResellers(updated);
+    const target = all.find((reseller) => reseller.uid === resellerId);
+    if (!target) return false;
 
-    try {
-      const docRef = doc(db, 'resellers', resellerId);
-      await deleteDoc(docRef);
-    } catch (fsErr) {
-      console.warn('Admin delete reseller Firestore notice:', fsErr);
-    }
+    const response = await fetch(`/api/v1/admin/members/${encodeURIComponent(resellerId)}/archive`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ archived }),
+    });
+    if (!response.ok) return false;
 
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('aurabio_resellers_updated'));
-      window.dispatchEvent(new CustomEvent('aurabio_members_updated'));
-      window.dispatchEvent(new CustomEvent('monoline_webhook_triggered'));
-      if (target?.referralCode) {
-        fetch(`/api/v1/admin/members/${encodeURIComponent(target.referralCode)}`, { method: 'DELETE' }).catch(() => {});
-      }
-      fetch(`/api/v1/admin/members/${encodeURIComponent(resellerId)}`, { method: 'DELETE' }).catch(() => {});
-    }
+    const data = await response.json();
+    const updatedReseller: Reseller = archived
+      ? {
+          ...target,
+          archivedAt: data.member?.archived_at || new Date().toISOString(),
+          archivedPreviousStatus: target.archivedPreviousStatus || target.status,
+          status: 'suspended',
+          updatedAt: new Date().toISOString(),
+        }
+      : {
+          ...target,
+          archivedAt: null,
+          status: target.archivedPreviousStatus || 'active',
+          archivedPreviousStatus: undefined,
+          updatedAt: new Date().toISOString(),
+        };
 
+    saveLocalResellers(all.map((reseller) => reseller.uid === resellerId ? updatedReseller : reseller));
+    await setDoc(doc(db, 'resellers', resellerId), updatedReseller, { merge: true });
+    window.dispatchEvent(new CustomEvent('aurabio_members_updated'));
+    window.dispatchEvent(new CustomEvent('monoline_webhook_triggered'));
     return true;
   } catch (err) {
-    console.error('Admin delete reseller error:', err);
+    console.error('Admin archive reseller error:', err);
     return false;
   }
 }
