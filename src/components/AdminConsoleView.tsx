@@ -335,7 +335,7 @@ export const AdminConsoleView: React.FC<AdminConsoleViewProps> = ({
     useState<Exclude<PackageId, 'CUSTOM'>>('PKG_ALTIN_PRO');
   const [newDealerCareerOverride, setNewDealerCareerOverride] = useState<string>('');
   const [newDealerSkipOrder, setNewDealerSkipOrder] = useState<boolean>(false);
-  const [newDealerPassword, setNewDealerPassword] = useState<string>('123456');
+  const [newDealerPassword, setNewDealerPassword] = useState<string>('');
   const [showNewDealerPassword, setShowNewDealerPassword] = useState<boolean>(false);
   const [newDealerLeg, setNewDealerLeg] = useState<'LEFT' | 'RIGHT' | 'AUTO'>('AUTO');
 
@@ -932,7 +932,8 @@ export const AdminConsoleView: React.FC<AdminConsoleViewProps> = ({
 
   const handleAddDealerSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!onRegisterMember || !newDealerName.trim()) return;
+    const password = newDealerPassword.trim();
+    if (!onRegisterMember || !newDealerName.trim() || !password) return;
     await onRegisterMember({
       full_name: newDealerName.trim(),
       email: newDealerEmail.trim() || undefined,
@@ -944,14 +945,14 @@ export const AdminConsoleView: React.FC<AdminConsoleViewProps> = ({
       manual_career_override:
         newDealerCareerOverride === '' ? null : Number(newDealerCareerOverride),
       skip_initial_order: newDealerSkipOrder,
-      password: newDealerPassword.trim() || '123456',
+      password,
       assigned_leg: newDealerLeg,
     });
     setNewDealerName('');
     setNewDealerEmail('');
     setNewDealerPhone('');
     setNewDealerRefCode('');
-    setNewDealerPassword('123456');
+    setNewDealerPassword('');
     setNewDealerLeg('AUTO');
   };
 
@@ -4064,7 +4065,7 @@ export const AdminConsoleView: React.FC<AdminConsoleViewProps> = ({
                       required
                       value={newDealerPassword}
                       onChange={(e) => setNewDealerPassword(e.target.value)}
-                      placeholder="Şifre belirleyin (Varsayılan: 123456)"
+                      placeholder="Giriş şifresi belirleyin"
                       className="w-full pl-3 pr-8 py-2 bg-slate-50 border border-slate-300 rounded-xl text-slate-900 font-mono font-medium"
                     />
                     <button

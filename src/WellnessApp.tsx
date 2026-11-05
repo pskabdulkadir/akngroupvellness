@@ -48,7 +48,10 @@ import { useKeyboardAvoidance } from './hooks/useKeyboardAvoidance';
 import { DemoExpiredModal } from './components/DemoExpiredModal';
 import { CampaignsModal } from './components/CampaignsModal';
 import { MonolineMlmPortalModal, MonolineSubTab } from './components/MonolineMlmPortalModal';
-import { syncFrekansWithMonolineEngine } from './utils/monolineSyncBridge';
+import {
+  syncFrekansWithMonolineEngine,
+  DealerRegistrationPrefill,
+} from './utils/monolineSyncBridge';
 import { DiseaseHealingProtocol } from './data/diseaseHealingLibrary';
 import { ActiveTab, ScanResult } from './types';
 import { getScanHistory, saveScanResult, deleteScanResult, clearScanHistory, syncScansFromFirestore } from './utils/storage';
@@ -145,6 +148,8 @@ export default function WellnessApp({
     return false;
   });
   const [authModalInitialMode, setAuthModalInitialMode] = useState<'login' | 'register' | 'dealer'>('login');
+  const [dealerRegistrationPrefill, setDealerRegistrationPrefill] =
+    useState<DealerRegistrationPrefill | null>(null);
   const [isPaymentModalOpen, setIsPaymentModalOpen] = useState<boolean>(() => initialNav.activeModal === 'payment');
   const [isResellerDashboardOpen, setIsResellerDashboardOpen] = useState<boolean>(() => initialNav.activeModal === 'reseller_dashboard' || initialNav.activeModal === 'reseller' || initialNav.activeModal === 'bayi' || initialNav.activeModal === 'dealer' || initialNav.activeModal === 'member_dashboard' || initialNav.activeModal === 'profile');
   const [isAdminOpen, setIsAdminOpen] = useState<boolean>(() => initialNav.activeModal === 'admin');
@@ -690,7 +695,9 @@ export default function WellnessApp({
       }
     };
 
-    const handleOpenDealerRegistration = () => {
+    const handleOpenDealerRegistration = (event: Event) => {
+      const detail = (event as CustomEvent<{ prefill?: DealerRegistrationPrefill | null }>).detail;
+      setDealerRegistrationPrefill(detail?.prefill ?? null);
       setIsMonolineModalOpen(false);
       setIsResellerDashboardOpen(false);
       setIsAdminOpen(false);
@@ -1165,6 +1172,7 @@ export default function WellnessApp({
           isOpen={isAuthModalOpen}
           allowClose={true}
           initialMode={authModalInitialMode}
+          dealerPrefill={dealerRegistrationPrefill}
           onClose={() => setIsAuthModalOpen(false)}
           onAuthSuccess={handleAuthSuccess}
           onStartDemo={() => {

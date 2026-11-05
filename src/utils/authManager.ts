@@ -1849,6 +1849,24 @@ export async function getMemberOrders(uid: string): Promise<MemberOrder[]> {
   return localOrders.sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
 }
 
+async function restoreMemberProfileFromServer(email: string, token: string): Promise<UserMember | null> {
+  try {
+    const res = await fetch('/api/v1/state', { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) return null;
+    const state = await res.json();
+    const serverMember = (state.members ?? []).find(
+      (m: { email?: string }) => m.email?.toLowerCase() === email
+    );
+    if (!serverMember) return null;
+    const { registerMonolineMemberToFrekans } = await import('./monolineSyncBridge');
+    await registerMonolineMemberToFrekans(serverMember);
+    return getLocalMembersDirectory().find((m) => m.email?.toLowerCase() === email) ?? null;
+  } catch (err) {
+    console.debug('Member profile restore notice:', err);
+    return null;
+  }
+}
+
 /**
  * Login existing member or administrator
  */
@@ -1978,6 +1996,10 @@ export async function loginMember(
       if (localMatch) {
         userData = localMatch;
       }
+    }
+
+    if (!userData && memberSession.success && memberSession.token) {
+      userData = await restoreMemberProfileFromServer(cleanEmail, memberSession.token);
     }
 
     if (!userData) {

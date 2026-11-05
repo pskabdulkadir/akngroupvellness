@@ -63,7 +63,7 @@ import {
   setActiveResellerSession, 
   clearStoredReferralCode, 
   loginAsReseller, 
-  registerNewReseller, 
+
   updateResellerBankInfo, 
   getCommissionsForReseller, 
   generateReferralLink, 
@@ -82,7 +82,7 @@ import {
   getReferredUsersForReseller,
   subscribeToResellersList
 } from '../utils/resellerManager';
-import { UserMember, BANK_INFO, ADMIN_PHONE, getMemberWalletToken } from '../utils/authManager';
+import { UserMember, BANK_INFO, ADMIN_PHONE } from '../utils/authManager';
 import { getMemberRegionalPendingUsd, getMemberRegionalUsdBalance } from '../utils/walletRegion';
 import { redirectToDealerRegistrationPortal, syncFrekansWithMonolineEngine } from '../utils/monolineSyncBridge';
 import { getSiteContent } from '../utils/siteContentManager';
@@ -169,17 +169,6 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
   const [subResellersLoading, setSubResellersLoading] = useState<boolean>(false);
   const [subResellersSearch, setSubResellersSearch] = useState<string>('');
   const [liveResellers, setLiveResellers] = useState<Reseller[]>([]);
-  const [showAddSubDealerForm, setShowAddSubDealerForm] = useState<boolean>(false);
-  const [subDealerName, setSubDealerName] = useState<string>('');
-  const [subDealerEmail, setSubDealerEmail] = useState<string>('');
-  const [subDealerPhone, setSubDealerPhone] = useState<string>('');
-  const [subDealerCity, setSubDealerCity] = useState<string>('İstanbul');
-  const [isAddingSubDealer, setIsAddingSubDealer] = useState<boolean>(false);
-  const [subDealerFeedback, setSubDealerFeedback] = useState<{
-    type: 'success' | 'error';
-    text: string;
-  } | null>(null);
-
   // Digital Invoices State
   const [invoices, setInvoices] = useState<DigitalInvoice[]>([]);
   const [selectedInvoice, setSelectedInvoice] = useState<DigitalInvoice | null>(null);
@@ -254,8 +243,6 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
   const [regBankName, setRegBankName] = useState<string>('');
   const [regAccountHolder, setRegAccountHolder] = useState<string>('');
   const [regIban, setRegIban] = useState<string>('');
-  const [isApplying, setIsApplying] = useState<boolean>(false);
-  const [applyMsg, setApplyMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Bank edit state
   const [bankForm, setBankForm] = useState<BankInfo>({
@@ -734,42 +721,11 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
 
   const handleNewResellerSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setIsApplying(true);
-    setApplyMsg(null);
-
-    try {
-      const res = await registerNewReseller({
-        resellerName: regName,
-        email: regEmail,
-        phone: regPhone,
-        customReferralCode: regCustomCode,
-        bankInfo: {
-          bankName: regBankName,
-          accountHolder: regAccountHolder || regName,
-          iban: regIban,
-        }
-      });
-
-      if (res.success && res.reseller) {
-        try {
-          sessionStorage.removeItem('aurabio_reseller_manual_logged_out');
-        } catch {}
-        setActiveReseller(res.reseller);
-        setApplyMsg({ type: 'success', text: res.message });
-        setBankForm(res.reseller.bankInfo);
-        const list = await getCommissionsForReseller(res.reseller.uid);
-        setCommissions(list);
-        setTimeout(() => {
-          setActiveTab('share');
-        }, 1200);
-      } else {
-        setApplyMsg({ type: 'error', text: res.message });
-      }
-    } catch (err: any) {
-      setApplyMsg({ type: 'error', text: err?.message || 'Başvuru yapılamadı.' });
-    } finally {
-      setIsApplying(false);
-    }
+    redirectToDealerRegistrationPortal(undefined, {
+      companyName: regName.trim(),
+      email: regEmail.trim(),
+      phone: regPhone.trim(),
+    });
   };
 
   const handleSaveBankInfo = async (e: React.FormEvent) => {
@@ -1034,17 +990,6 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
                 </span>
               </div>
 
-              {applyMsg && (
-                <div className={`p-3 rounded-xl border text-xs flex items-center gap-2 ${
-                  applyMsg.type === 'success' 
-                    ? 'bg-emerald-950/80 border-emerald-500/50 text-emerald-300' 
-                    : 'bg-rose-950/80 border-rose-500/50 text-rose-300'
-                }`}>
-                  {applyMsg.type === 'success' ? <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" /> : <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />}
-                  <span>{applyMsg.text}</span>
-                </div>
-              )}
-
               <form onSubmit={handleNewResellerSubmit} className="space-y-2.5 pt-1">
                 <div className="space-y-1">
                   <label className="text-[11px] font-semibold text-slate-300">İşletme / Bayi Adı:</label>
@@ -1099,10 +1044,9 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
 
                 <button
                   type="submit"
-                  disabled={isApplying}
                   className="w-full mt-2 py-3 rounded-xl bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 hover:to-emerald-500 text-white font-bold text-xs shadow-lg shadow-teal-950/60 transition-all flex items-center justify-center gap-2"
                 >
-                  {isApplying ? 'Başvuru Kaydediliyor...' : 'Bayilik Hesabını Anında Oluştur'}
+                  Bayilik Kaydına Devam Et
                   <Sparkles className="w-4 h-4" />
                 </button>
               </form>
@@ -1730,177 +1674,6 @@ export const ResellerDashboardModal: React.FC<ResellerDashboardModalProps> = ({
                     </button>
                   </div>
                 </div>
-
-                {subDealerFeedback && (
-                  <div
-                    className={`p-4 rounded-2xl border text-xs font-semibold flex items-center justify-between gap-3 ${
-                      subDealerFeedback.type === 'success'
-                        ? 'bg-emerald-950/90 border-emerald-500/50 text-emerald-200'
-                        : 'bg-rose-950/90 border-rose-500/50 text-rose-200'
-                    }`}
-                  >
-                    <span>{subDealerFeedback.text}</span>
-                    <button
-                      type="button"
-                      onClick={() => setSubDealerFeedback(null)}
-                      className="text-xs underline cursor-pointer"
-                    >
-                      Kapat
-                    </button>
-                  </div>
-                )}
-
-                {showAddSubDealerForm && (
-                  <form
-                    onSubmit={async (e) => {
-                      e.preventDefault();
-                      if (!subDealerName.trim() || !subDealerEmail.trim() || !subDealerPhone.trim()) return;
-                      setIsAddingSubDealer(true);
-                      setSubDealerFeedback(null);
-                      try {
-                        const res = await registerNewReseller({
-                          resellerName: subDealerName.trim(),
-                          email: subDealerEmail.trim(),
-                          phone: subDealerPhone.trim(),
-                          referredByCode: activeReseller.referralCode,
-                          sponsorId: activeReseller.uid,
-                          keepCurrentSession: true,
-                        });
-                        if (!res.success) {
-                          setSubDealerFeedback({ type: 'error', text: res.message });
-                        } else {
-                          const monolineResponse = await fetch('/api/v1/members', {
-                            method: 'POST',
-                            headers: {
-                              'Content-Type': 'application/json',
-                              ...(getMemberWalletToken()
-                                ? { Authorization: `Bearer ${getMemberWalletToken()}` }
-                                : {}),
-                            },
-                            body: JSON.stringify({
-                              user_id: res.reseller?.uid,
-                              full_name: subDealerName.trim(),
-                              city: subDealerCity.trim() || 'İstanbul',
-                              email: subDealerEmail.trim(),
-                              phone: subDealerPhone.trim(),
-                              ref_code: res.reseller?.referralCode,
-                              sponsor_id: activeReseller.uid,
-                              initial_package_id: 'PKG_MINI_DENEME',
-                            }),
-                          });
-                          if (!monolineResponse.ok) {
-                            throw new Error('Bayi hesabı oluşturuldu, ancak Monoline kaydı yönetici onayı gerektiriyor.');
-                          }
-                          setSubDealerFeedback({
-                            type: 'success',
-                            text: `${subDealerName.trim()} sizin doğrudan sponsorluğunuzda (${activeReseller.referralCode}) alt bayi olarak kaydedildi ve Monoline tek hat ağacınıza eklendi!`,
-                          });
-                          setSubDealerName('');
-                          setSubDealerEmail('');
-                          setSubDealerPhone('');
-                          setShowAddSubDealerForm(false);
-                          await loadReferredUsersList();
-                        }
-                      } catch (err: any) {
-                        setSubDealerFeedback({
-                          type: 'error',
-                          text: err?.message || 'Alt bayi kaydedilirken hata oluştu.',
-                        });
-                      } finally {
-                        setIsAddingSubDealer(false);
-                      }
-                    }}
-                    className="p-5 rounded-3xl bg-slate-950/90 border border-emerald-500/40 space-y-4"
-                  >
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <h4 className="text-sm font-bold text-emerald-300">
-                          Kendi Sponsorluğunuzda Yeni Alt Bayi Oluştur
-                        </h4>
-                        <p className="text-[11px] text-slate-400">
-                          Yeni kaydedilen bayinin Direkt Sponsoru otomatik olarak siz (
-                          <strong className="text-white">{activeReseller.resellerName}</strong> —{' '}
-                          <span className="font-mono text-emerald-300">
-                            {activeReseller.referralCode}
-                          </span>
-                          ) olursunuz ve Monoline tek hat ağacınızda sizden sonraki sıraya eklenir.
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => setShowAddSubDealerForm(false)}
-                        className="text-xs text-slate-400 hover:text-white cursor-pointer"
-                      >
-                        Kapat
-                      </button>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-                      <div>
-                        <label className="block text-[11px] font-semibold text-slate-300 mb-1">
-                          Alt Bayi Adı / Unvanı
-                        </label>
-                        <input
-                          type="text"
-                          required
-                          value={subDealerName}
-                          onChange={(e) => setSubDealerName(e.target.value)}
-                          placeholder="Örn: Ege Frekans Merkezi"
-                          className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white outline-none focus:border-emerald-500"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[11px] font-semibold text-slate-300 mb-1">
-                          E-Posta Adresi
-                        </label>
-                        <input
-                          type="email"
-                          required
-                          value={subDealerEmail}
-                          onChange={(e) => setSubDealerEmail(e.target.value)}
-                          placeholder="altbayi@mail.com"
-                          className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white outline-none focus:border-emerald-500"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[11px] font-semibold text-slate-300 mb-1">
-                          Telefon / WhatsApp
-                        </label>
-                        <input
-                          type="tel"
-                          required
-                          value={subDealerPhone}
-                          onChange={(e) => setSubDealerPhone(e.target.value)}
-                          placeholder="05XX XXX XX XX"
-                          className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white outline-none focus:border-emerald-500"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[11px] font-semibold text-slate-300 mb-1">
-                          Direkt Sponsoru (Otomatik Kilitli)
-                        </label>
-                        <div className="w-full px-3 py-2 rounded-xl bg-emerald-950/70 border border-emerald-500/40 text-xs font-bold text-emerald-300 flex items-center gap-1.5 truncate">
-                          <Lock className="w-3.5 h-3.5 shrink-0" />
-                          <span className="truncate">
-                            {activeReseller.resellerName} ({activeReseller.referralCode})
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="flex justify-end gap-2">
-                      <button
-                        type="submit"
-                        disabled={isAddingSubDealer}
-                        className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs cursor-pointer disabled:opacity-50"
-                      >
-                        {isAddingSubDealer
-                          ? 'Alt Bayi Kaydediliyor...'
-                          : 'Sponsorluğumda Kaydet ve Tek Hat Ağacıma Ekle'}
-                      </button>
-                    </div>
-                  </form>
-                )}
 
                 {/* SOL KOL & SAĞ KOL (İKİLİ DENGE HATTI) + YETERLİLİKLER VE EKSİKLER ANALİZ PANELİ */}
                 {(() => {

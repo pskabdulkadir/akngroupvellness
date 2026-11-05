@@ -63,6 +63,7 @@ import {
   getDeviceDemoStatus, 
   DeviceDemoStatus 
 } from '../utils/deviceDemoManager';
+import type { DealerRegistrationPrefill } from '../utils/monolineSyncBridge';
 import { PackageDetailModal } from './PackageDetailModal';
 import { LegalContractsModal, LegalContractTab } from './LegalContractsModal';
 
@@ -73,6 +74,7 @@ interface AuthModalProps {
   onStartDemo?: () => void;
   allowClose?: boolean;
   initialMode?: 'login' | 'register' | 'dealer';
+  dealerPrefill?: DealerRegistrationPrefill | null;
 }
 
 export const AuthModal: React.FC<AuthModalProps> = ({
@@ -82,6 +84,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   onStartDemo,
   allowClose = false,
   initialMode = 'login',
+  dealerPrefill = null,
 }) => {
   // Check if URL specifies dealer mode
   const checkIsDealerFromUrl = (): boolean => {
@@ -227,6 +230,13 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
     loadResellers();
   }, [isOpen, initialMode]);
+
+  useEffect(() => {
+    if (!dealerPrefill) return;
+    if (dealerPrefill.companyName) setDealerCompanyName(dealerPrefill.companyName);
+    if (dealerPrefill.email) setRegEmail(dealerPrefill.email);
+    if (dealerPrefill.phone) setRegPhone(dealerPrefill.phone);
+  }, [dealerPrefill]);
 
   // Strict enforcement: ensure selected package exists
   useEffect(() => {

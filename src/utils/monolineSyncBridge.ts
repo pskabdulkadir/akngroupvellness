@@ -1199,13 +1199,22 @@ export async function registerMonolineMemberToFrekans(
  * "Bayilik Başvurusu / Kayıt" (AuthModal in 'dealer' / 'register' mode), automatically locking
  * the current dealer as the Direct Sponsor / Referrer.
  */
-export function redirectToDealerRegistrationPortal(sponsor?: {
-  user_id: string;
-  full_name: string;
-  ref_code: string;
+export interface DealerRegistrationPrefill {
+  companyName?: string;
   email?: string;
   phone?: string;
-}): void {
+}
+
+export function redirectToDealerRegistrationPortal(
+  sponsor?: {
+    user_id: string;
+    full_name: string;
+    ref_code: string;
+    email?: string;
+    phone?: string;
+  },
+  prefill?: DealerRegistrationPrefill
+): void {
   if (typeof window === 'undefined') return;
 
   try {
@@ -1262,7 +1271,7 @@ export function redirectToDealerRegistrationPortal(sponsor?: {
 
   window.dispatchEvent(
     new CustomEvent('aurabio_open_dealer_registration', {
-      detail: sponsor || null,
+      detail: { sponsor: sponsor || null, prefill: prefill || null },
     })
   );
 }

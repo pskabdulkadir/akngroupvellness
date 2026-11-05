@@ -6256,15 +6256,15 @@ async function startServer() {
         });
         return;
       }
-      if (password && String(password).length < 8) {
-        res.status(400).json({ status: 'error', code: 'WEAK_MEMBER_PASSWORD', message: 'Üye parolası en az 8 karakter olmalıdır.' });
+      if (!password || String(password).length < 8) {
+        res.status(400).json({ status: 'error', code: 'WEAK_MEMBER_PASSWORD', message: 'Üye parolası zorunludur ve en az 8 karakter olmalıdır.' });
         return;
       }
 
       const authHdr = req.headers.authorization;
       const tok = authHdr?.startsWith('Bearer ') ? authHdr.slice('Bearer '.length).trim() : null;
       const isCallingAdmin = Boolean(tok && verifyAdminToken(tok));
-      const credentials = password ? hashMemberPassword(String(password)) : null;
+      const credentials = hashMemberPassword(String(password));
       const result = await commitMemberChange(() => createMemberRecord(req.body, isCallingAdmin, credentials));
 
       res.status(201).json({
