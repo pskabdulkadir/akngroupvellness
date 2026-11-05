@@ -25,16 +25,25 @@ import {
   GitBranch,
   Info
 } from 'lucide-react';
-import { 
-  registerMember, 
-  loginMember, 
-  UserMember, 
+import {
+  registerMember,
+  finalizeMemberRegistration,
+  loginMember,
+  UserMember,
   MembershipPackage,
+  PendingMemberRegistration,
+  RegistrationDraft,
   getMembershipPackages,
   subscribeToMembershipPackages,
   MEMBERSHIP_PACKAGES,
-  getWhatsAppDealerApplicationUrl 
+  getWhatsAppDealerApplicationUrl
 } from '../utils/authManager';
+import {
+  payPendingRegistration,
+  SANDBOX_TEST_CARDS,
+  SANDBOX_TEST_CARD_CVV,
+  SANDBOX_TEST_CARD_EXPIRY,
+} from '../utils/paymentProcessor';
 import { DealerDetails } from '../types';
 import { getPackagePriceForRegion, MEMBER_COUNTRY_OPTIONS, resolveMemberRegion } from '../utils/walletRegion';
 import { formatUsd } from '../utils/currency';
@@ -141,6 +150,15 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+
+  const [pendingRegistration, setPendingRegistration] = useState<{
+    pending: PendingMemberRegistration;
+    draft: RegistrationDraft;
+  } | null>(null);
+  const [cardHolder, setCardHolder] = useState<string>('');
+  const [cardNumber, setCardNumber] = useState<string>('');
+  const [cardExpiry, setCardExpiry] = useState<string>('');
+  const [cardCvv, setCardCvv] = useState<string>('');
 
   const registrationRegion = resolveMemberRegion(regCountryCode);
   const isInternationalRegistration = registrationRegion === 'INTERNATIONAL';
@@ -354,9 +372,15 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         regCountryCode
       );
 
+      if (res.success && res.pending && res.draft) {
+        setPendingRegistration({ pending: res.pending, draft: res.draft });
+        setSuccessMsg(res.message);
+        return;
+      }
+
       if (res.success && res.user) {
         setSuccessMsg(res.message);
-        
+
         if (res.whatsappDealerUrl) {
           setPendingWhatsappUrl(res.whatsappDealerUrl);
           // Wait a moment so user sees the message, or allow click
@@ -373,6 +397,36 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       }
     } catch (err: any) {
       setErrorMsg(err?.message || 'Kayıt işlemi başarısız.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleCompletePayment = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!pendingRegistration) return;
+
+    setIsLoading(true);
+    setErrorMsg(null);
+    try {
+      const { memberUserId } = await payPendingRegistration(pendingRegistration.pending, {
+        cardHolder: cardHolder.trim(),
+        cardNumber: cardNumber.trim(),
+        cardExpiry: cardExpiry.trim(),
+        cardCvv: cardCvv.trim(),
+      });
+      const res = await finalizeMemberRegistration(pendingRegistration.draft, memberUserId);
+      if (!res.success || !res.user) {
+        setErrorMsg(res.message);
+        return;
+      }
+
+      setPendingRegistration(null);
+      setSuccessMsg(res.message);
+      if (res.whatsappDealerUrl) setPendingWhatsappUrl(res.whatsappDealerUrl);
+      setTimeout(() => onAuthSuccess(res.user!, true), res.whatsappDealerUrl ? 1500 : 600);
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Ödeme tamamlanamadı.');
     } finally {
       setIsLoading(false);
     }
@@ -554,8 +608,98 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           </div>
         )}
 
+        {/* PAYMENT FORM (registration awaiting payment) */}
+        {pendingRegistration ? (
+          <form onSubmit={handleCompletePayment} className="space-y-3.5">
+            <div className="p-3.5 rounded-2xl bg-slate-950 border border-amber-500/40 space-y-1.5">
+              <div className="flex items-center gap-2 font-bold text-xs text-amber-300">
+                <CreditCard className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>Ödeme Adımı</span>
+              </div>
+              <p className="text-[11px] text-slate-300">
+                Ödenecek tutar:{' '}
+                <span className="font-bold text-emerald-300">{formatUsd(pendingRegistration.pending.amount)}</span>
+                . Üyeliğiniz ödeme onaylandıktan sonra aktifleşir.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              {Object.values(SANDBOX_TEST_CARDS).map((card) => (
+                <button
+                  key={card.number}
+                  type="button"
+                  onClick={() => {
+                    setCardNumber(card.number);
+                    setCardExpiry(SANDBOX_TEST_CARD_EXPIRY);
+                    setCardCvv(SANDBOX_TEST_CARD_CVV);
+                  }}
+                  className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-200 border border-slate-700 cursor-pointer"
+                >
+                  {card.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-[11px] font-semibold text-slate-300">Kart Üzerindeki Ad Soyad:</label>
+              <input
+                type="text"
+                required
+                value={cardHolder}
+                onChange={(e) => setCardHolder(e.target.value)}
+                className="w-full px-3 py-2.5 rounded-xl bg-slate-950 border border-slate-700 focus:border-amber-500 text-xs text-slate-100 outline-none"
+              />
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-[11px] font-semibold text-slate-300">Kart Numarası:</label>
+              <input
+                type="text"
+                inputMode="numeric"
+                required
+                value={cardNumber}
+                onChange={(e) => setCardNumber(e.target.value)}
+                className="w-full px-3 py-2.5 rounded-xl bg-slate-950 border border-slate-700 focus:border-amber-500 text-xs text-slate-100 outline-none"
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <label className="text-[11px] font-semibold text-slate-300">Son Kullanma (AA/YY):</label>
+                <input
+                  type="text"
+                  required
+                  value={cardExpiry}
+                  onChange={(e) => setCardExpiry(e.target.value)}
+                  className="w-full px-3 py-2.5 rounded-xl bg-slate-950 border border-slate-700 focus:border-amber-500 text-xs text-slate-100 outline-none"
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-[11px] font-semibold text-slate-300">CVV:</label>
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  required
+                  value={cardCvv}
+                  onChange={(e) => setCardCvv(e.target.value)}
+                  className="w-full px-3 py-2.5 rounded-xl bg-slate-950 border border-slate-700 focus:border-amber-500 text-xs text-slate-100 outline-none"
+                />
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              disabled={isLoading}
+              className="w-full mt-2 py-3 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-lg transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+            >
+              {isLoading ? 'Ödeme İşleniyor...' : 'Ödemeyi Yap ve Üyeliği Aktifleştir'}
+              <ArrowRight className="w-4 h-4" />
+            </button>
+          </form>
+        ) : null}
+
         {/* LOGIN FORM */}
-        {tab === 'login' ? (
+        {pendingRegistration ? null : tab === 'login' ? (
           <form onSubmit={handleLoginSubmit} className="space-y-3.5">
             <div className="space-y-1">
               <label className="text-[11px] font-semibold text-slate-300 flex items-center gap-1.5">

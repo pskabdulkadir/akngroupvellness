@@ -853,8 +853,36 @@ export function getWhatsAppDealerApplicationUrl(data: {
   return `https://wa.me/${ADMIN_PHONE_CLEAN}?text=${encodeURIComponent(text)}`;
 }
 
+export interface RegistrationDraft {
+  cleanEmail: string;
+  cleanFullName: string;
+  cleanPhone: string;
+  cleanCountryCode: string;
+  password: string;
+  selectedPackage: string;
+  resellerId?: string;
+  referredByCode?: string;
+  dealerApplicationData?: DealerDetails;
+}
+
+export interface PendingMemberRegistration {
+  registrationId: string;
+  paymentToken: string;
+  amount: number;
+}
+
+export interface RegisterMemberResult {
+  success: boolean;
+  message: string;
+  user?: UserMember;
+  whatsappDealerUrl?: string;
+  pending?: PendingMemberRegistration;
+  draft?: RegistrationDraft;
+}
+
 /**
- * Register a new member (with optional dealer application & affiliate / reseller connection)
+ * Register a new member (with optional dealer application & affiliate / reseller connection).
+ * The member is created on the server only after payment; the local session is set up by finalizeMemberRegistration.
  */
 export async function registerMember(
   fullName: string,
@@ -866,7 +894,7 @@ export async function registerMember(
   referredByCode?: string,
   dealerApplicationData?: DealerDetails,
   countryCode: string = 'TR'
-): Promise<{ success: boolean; message: string; user?: UserMember; whatsappDealerUrl?: string }> {
+): Promise<RegisterMemberResult> {
   try {
     const cleanEmail = email.trim().toLowerCase();
     const cleanFullName = fullName.trim();
@@ -922,10 +950,76 @@ export async function registerMember(
       return { success: false, message: 'Bu e-posta adresi ile zaten kayıtlı bir üye bulunmaktadır.' };
     }
 
+    const { mapFrekansPkgToMonolinePkgId } = await import('./monolineSyncBridge');
+    const registrationResponse = await fetch('/api/v1/registrations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        full_name: cleanFullName,
+        email: cleanEmail,
+        phone: cleanPhone,
+        password,
+        city: dealerApplicationData?.address?.trim() || dealerApplicationData?.taxOffice?.trim() || 'İstanbul',
+        country_code: cleanCountryCode,
+        ref_code: referredByCode || '',
+        initial_package_id: mapFrekansPkgToMonolinePkgId(selectedPackage || 'pkg-5k'),
+      }),
+    });
+    const registrationBody = await registrationResponse.json().catch(() => ({}));
+    if (!registrationResponse.ok || registrationBody.status !== 'success') {
+      return { success: false, message: registrationBody.message || 'Kayıt oluşturulamadı.' };
+    }
+
+    return {
+      success: true,
+      message: 'Kaydınız alındı. Üyeliğiniz ödeme onaylandıktan sonra aktifleşecek.',
+      pending: {
+        registrationId: registrationBody.registration_id,
+        paymentToken: registrationBody.payment_token,
+        amount: Number(registrationBody.payment?.amount),
+      },
+      draft: {
+        cleanEmail,
+        cleanFullName,
+        cleanPhone,
+        cleanCountryCode,
+        password,
+        selectedPackage,
+        resellerId,
+        referredByCode,
+        dealerApplicationData,
+      },
+    };
+  } catch (err: any) {
+    console.error('Member registration error:', err);
+    return { success: false, message: err?.message || 'Üyelik oluşturulurken bir hata meydana geldi.' };
+  }
+}
+
+/**
+ * Ödeme tamamlandıktan sonra yerel oturumu ve bayi kayıtlarını oluşturur.
+ */
+export async function finalizeMemberRegistration(
+  draft: RegistrationDraft,
+  serverUserId: string
+): Promise<RegisterMemberResult> {
+  try {
+    const {
+      cleanEmail,
+      cleanFullName,
+      cleanPhone,
+      cleanCountryCode,
+      password,
+      selectedPackage,
+      resellerId,
+      referredByCode,
+      dealerApplicationData,
+    } = draft;
+
     // Check if demo was previously used by this phone or email
     const wasDemoUsed = await checkIfDemoAlreadyUsed(cleanPhone, cleanEmail, cleanFullName);
 
-    const uid = generateUid();
+    const uid = serverUserId;
     const isDealer = true; // In the unified dealer architecture, all registrations are Dealer registrations
 
     const {
@@ -1114,36 +1208,11 @@ export async function registerMember(
       dealerDetails: completeDealerDetails
     });
 
-    // 5. Sync new registration & package order with Monoline 7 Nefis MLM & Commission Engine
+    // 5. Member is already activated on the server; obtain the wallet session and sync the Frekans engine
     try {
       const m = await import('./monolineSyncBridge');
-      const monolinePkgId = m.mapFrekansPkgToMonolinePkgId(effectiveStarterPkg);
-      const memberResponse = await fetch('/api/v1/members', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...((getAdminToken() ?? getMemberWalletToken())
-            ? { Authorization: `Bearer ${getAdminToken() ?? getMemberWalletToken()}` }
-            : {}),
-        },
-        body: JSON.stringify({
-          user_id: uid,
-          full_name: companyName || cleanFullName,
-          city: completeDealerDetails.address || completeDealerDetails.taxOffice || 'İstanbul',
-          email: cleanEmail,
-          phone: cleanPhone,
-          ref_code: personalReferralCode,
-          country_code: cleanCountryCode,
-          sponsor_id: resellerId || '',
-          initial_package_id: monolinePkgId,
-          password,
-          assigned_leg: dealerApplicationData?.assignedLeg || 'AUTO',
-        }),
-      });
-      if (memberResponse.ok) {
-        const session = await requestMemberWalletToken(cleanEmail, password);
-        if (session.token) saveMemberWalletToken(session.token);
-      }
+      const session = await requestMemberWalletToken(cleanEmail, password);
+      if (session.token) saveMemberWalletToken(session.token);
 
       m.syncFrekansWithMonolineEngine().then(() => {
         if (typeof window !== 'undefined') {

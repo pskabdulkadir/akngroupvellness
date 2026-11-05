@@ -190,9 +190,282 @@ function memberRegistryEncryptionKey(): Buffer {
     .digest();
 }
 
+const MEMBER_REGISTRY_LOCK_KEY = 1574130996;
+const ADMIN_SPONSOR_USER_ID = 'ADMIN';
+
+type MemberCredentials = { salt: string; hash: string };
+
+async function commitMemberChange<T>(createRecord: () => T): Promise<T> {
+  return runInAtomicTransaction(async () => {
+    const membersSnapshot = structuredClone(members);
+    const credentialsSnapshot = new Map(memberCredentials);
+    try {
+      const registration = createRecord();
+      await persistMemberRegistry();
+      return registration;
+    } catch (error) {
+      members = membersSnapshot;
+      memberCredentials.clear();
+      credentialsSnapshot.forEach((value, key) => memberCredentials.set(key, value));
+      throw error;
+    }
+  });
+}
+
+function createMemberRecord(
+  body: Record<string, any>,
+  isCallingAdmin: boolean,
+  credentials: MemberCredentials | null
+): { newMember: MonolineMember; tx: CommissionTransaction | null } {
+  const {
+    user_id,
+    full_name,
+    email,
+    phone,
+    ref_code,
+    city,
+    country_code,
+    initial_package_id,
+    manual_career_override,
+    skip_initial_order,
+    session_credits,
+    assigned_leg,
+  } = body;
+  const normalizedCountryCode = String(country_code || 'TR').trim().toUpperCase();
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (normalizedEmail && members.some((existing) => existing.email.toLowerCase() === normalizedEmail)) {
+    const error: any = new Error('Bu e-posta adresiyle kayıtlı bir bayi zaten var.');
+    error.statusCode = 409;
+    error.code = 'DUPLICATE_EMAIL';
+    throw error;
+  }
+  const requestedUserId = String(user_id || '').trim();
+  if (requestedUserId && members.some((existing) => existing.user_id === requestedUserId)) {
+    const error: any = new Error('Bu kullanıcı kimliği zaten kayıtlı.');
+    error.statusCode = 409;
+    error.code = 'DUPLICATE_USER_ID';
+    throw error;
+  }
+  const nextLineId = members.length + 1;
+  const randSuffix = Math.random().toString(36).substring(2, 8).toUpperCase();
+  const newUserId = requestedUserId || `USR-${randSuffix}`;
+  const pkgKey = normalizePackageId(initial_package_id || 'PKG_ALTIN_PRO') || 'PKG_ALTIN_PRO';
+  const nowIso = new Date().toISOString();
+  const sponsorMember = members.reduce<MonolineMember | undefined>(
+    (latest, member) => (!latest || member.global_line_id > latest.global_line_id ? member : latest),
+    undefined
+  );
+  const sponsorUserId = sponsorMember ? sponsorMember.user_id : ADMIN_SPONSOR_USER_ID;
+
+  const customRef = ref_code ? String(ref_code).trim().toUpperCase() : '';
+
+  const skipInitialOrder = isCallingAdmin && Boolean(skip_initial_order);
+
+  const manualCareer =
+    isCallingAdmin &&
+    manual_career_override !== undefined &&
+    manual_career_override !== null &&
+    manual_career_override !== ''
+      ? Number(manual_career_override)
+      : null;
+
+  const effectiveCredits =
+    isCallingAdmin && typeof session_credits === 'number' && session_credits >= 0
+      ? Math.round(session_credits)
+      : skipInitialOrder
+      ? WELCOME_BONUS_TOTAL_CREDITS
+      : (PACKAGES[pkgKey]?.sessionCredits ?? 32);
+
+  let finalLeg: 'LEFT' | 'RIGHT' = 'LEFT';
+  if (assigned_leg === 'LEFT' || assigned_leg === 'RIGHT') {
+    finalLeg = assigned_leg;
+  } else if (sponsorMember) {
+    const leftCount = members.filter(
+      (m) => m.sponsor_id === sponsorUserId && (m as any).assigned_leg === 'LEFT'
+    ).length;
+    const rightCount = members.filter(
+      (m) => m.sponsor_id === sponsorUserId && (m as any).assigned_leg === 'RIGHT'
+    ).length;
+    finalLeg = leftCount <= rightCount ? 'LEFT' : 'RIGHT';
+  }
+
+  const newMember: MonolineMember = {
+    id: nextLineId,
+    user_id: newUserId,
+    global_line_id: nextLineId,
+    ref_code: customRef || `AURA-BAYI-${Math.floor(1000 + Math.random() * 9000)}`,
+    full_name: String(full_name).trim(),
+    email:
+      email && String(email).trim()
+        ? String(email).trim()
+        : `${String(full_name)
+            .toLowerCase()
+            .replace(/[^a-z0-9]/g, '.')
+            .replace(/\.+/g, '.')}@akngroupfrekans.com`,
+    phone: phone ? String(phone).trim() : '',
+    city: String(city || 'Türkiye').trim(),
+    country_code: normalizedCountryCode,
+    joined_at: nowIso,
+    sponsor_id: sponsorUserId,
+    sponsor_db_id: sponsorMember ? sponsorMember.id : null,
+    highest_package_id: pkgKey,
+    session_credits: effectiveCredits,
+    personal_volume: 0,
+    group_volume: 0,
+    active_direct_referrals: 0,
+    career_level: 1,
+    career_title: 'Emmâre',
+    manual_career_override: manualCareer,
+    unlocked_depth: 1,
+    wallets: {
+      sponsor_wallet: 0,
+      monoline_wallet: 0,
+      career_pool_wallet: 0,
+      total_earnings: 0,
+      wallet_domestic_usd: 0,
+      wallet_international_usd: 0,
+
+      system_fund_balance: 0,
+      total_withdrawn: 0,
+    },
+    bank_details: {
+      iban_holder_name: String(full_name).trim(),
+      bank_name: 'Ziraat Bankası',
+      iban: `TR${Math.floor(10 + Math.random() * 89)} 0001 0004 8271 9283 10${nextLineId}`,
+      trc20_address: `T${Math.random()
+        .toString(36)
+        .substring(2, 15)
+        .toUpperCase()}9X2K${nextLineId}`,
+      preferred_method: 'IBAN',
+    },
+    two_factor: generateTwoFactorConfig().config,
+    is_active: true,
+    is_locked: false,
+    activity_expires_at: createFutureExpiryIso(),
+    welcome_bonus_granted: skipInitialOrder,
+    welcome_bonus_credits: skipInitialOrder ? WELCOME_BONUS_TOTAL_CREDITS : 0,
+    tc_identity_no:
+      body.tc_identity_no || `${Math.floor(10000000000 + Math.random() * 89999999999)}`,
+    has_tax_company: Boolean(body.has_tax_company),
+    last_login_ip: body.last_login_ip || `176.240.${Math.floor(10 + Math.random() * 200)}.${nextLineId}`,
+    device_fingerprint: body.device_fingerprint || `DEV-FP-${nextLineId}`,
+    kvkk_approved_at: nowIso,
+    contract_version: body.contract_version || 'v2.0',
+    daily_withdrawal_limit: DAILY_WITHDRAWAL_LIMITS_BY_CAREER[manualCareer || 1] || 5000,
+    fast_start_awarded: false,
+    assigned_leg: finalLeg,
+    left_leg_volume: 0,
+    right_leg_volume: 0,
+  };
+
+  members.push(newMember);
+  if (credentials) memberCredentials.set(newMember.user_id, credentials);
+
+  if (skipInitialOrder) {
+    creditsOwnedByServer.add(newMember.user_id);
+    logActivityEvent({
+      member: newMember,
+      action_type: 'WELCOME_BONUS_GRANTED',
+      previous_expires_at: newMember.activity_expires_at,
+      new_expires_at: newMember.activity_expires_at,
+      description: `🎁 İlk Bayi Kaydı Hoşgeldin Bonusu: ${newMember.full_name} hesabına bir defaya mahsus 32+32 (Toplam ${WELCOME_BONUS_TOTAL_CREDITS}) Seans Kredisi otomatik tanımlandı.`,
+    });
+    recalculateAllCareers('MANUAL_ADMIN');
+    return { newMember, tx: null };
+  }
+
+  const orderAmt = getPackageOrderAmount(newUserId, pkgKey);
+  const tx = processOrderCommission({
+    user_id: newUserId,
+    order_id: `ORD-KAYIT-${nextLineId}-${Date.now().toString().slice(-4)}`,
+    order_amount: orderAmt,
+    package_id: pkgKey,
+    timestamp: nowIso,
+  });
+  return { newMember, tx };
+}
+
+function pendingRegistrationTokenHash(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+function pendingRegistrationEmailHash(email: string): string {
+  return createHmac('sha256', memberRegistryEncryptionKey()).update(email).digest('hex');
+}
+
+function createIpRateLimiter(windowMs: number, maxRequests: number): express.RequestHandler {
+  const hits = new Map<string, { count: number; resetAt: number }>();
+  return (req, res, next) => {
+    const now = Date.now();
+    if (hits.size > 5000) {
+      for (const [key, entry] of hits) {
+        if (entry.resetAt <= now) hits.delete(key);
+      }
+    }
+    const key = req.ip || 'unknown';
+    const entry = hits.get(key);
+    if (!entry || entry.resetAt <= now) {
+      hits.set(key, { count: 1, resetAt: now + windowMs });
+      next();
+      return;
+    }
+    entry.count += 1;
+    if (entry.count > maxRequests) {
+      res.status(429).json({ status: 'error', code: 'RATE_LIMITED', message: 'Çok fazla istek gönderildi. Lütfen daha sonra tekrar deneyin.' });
+      return;
+    }
+    next();
+  };
+}
+
+const registrationCreateRateLimiter = createIpRateLimiter(10 * 60 * 1000, 10);
+const registrationActionRateLimiter = createIpRateLimiter(10 * 60 * 1000, 30);
+
+async function recoverInterruptedRegistrations(): Promise<void> {
+  const interrupted = await getPostgresPool().query(
+    `SELECT registration_id, payload_ciphertext FROM pending_member_registrations WHERE status = 'ACTIVATING'`
+  );
+  for (const row of interrupted.rows) {
+    const { body } = decryptPendingRegistrationPayload(row.payload_ciphertext);
+    const email = String(body.email || '').trim().toLowerCase();
+    const member = members.find((existing) => existing.email.toLowerCase() === email);
+    if (member) {
+      await getPostgresPool().query(
+        `UPDATE pending_member_registrations SET status = 'ACTIVE', member_user_id = $2, activated_at = NOW()
+         WHERE registration_id = $1 AND status = 'ACTIVATING'`,
+        [row.registration_id, member.user_id]
+      );
+    } else {
+      await getPostgresPool().query(
+        `UPDATE pending_member_registrations SET status = 'PAID_NEEDS_REVIEW'
+         WHERE registration_id = $1 AND status = 'ACTIVATING'`,
+        [row.registration_id]
+      );
+    }
+  }
+}
+
+async function loadPendingRegistration(registrationId: string, paymentToken: string) {
+  if (!registrationId || !paymentToken) return null;
+  const result = await getPostgresPool().query(
+    `SELECT registration_id, payment_token_hash, status, merchant_oid, payload_ciphertext,
+            created_at < NOW() - INTERVAL '24 hours' AS is_expired
+     FROM pending_member_registrations WHERE registration_id = $1`,
+    [registrationId]
+  );
+  const row = result.rows[0];
+  if (!row || row.payment_token_hash !== pendingRegistrationTokenHash(paymentToken)) return null;
+  return row;
+}
+
+function decryptPendingRegistrationPayload(ciphertext: Buffer): { body: Record<string, any>; credentials: MemberCredentials } {
+  return decryptAccountingPii(Buffer.from(ciphertext), memberRegistryEncryptionKey());
+}
+
 async function persistMemberRegistry(): Promise<void> {
   const key = memberRegistryEncryptionKey();
   await withTransaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock($1)', [MEMBER_REGISTRY_LOCK_KEY]);
     for (const member of members) {
       const credentials = memberCredentials.get(member.user_id) || null;
       await client.query(
@@ -3639,9 +3912,7 @@ function buildStateResponse(isAdmin: boolean = false, memberUid: string | null =
   const deliveredMembers = isAdmin
     ? members.map((member) => ({
         ...member,
-        two_factor: member.two_factor
-          ? { ...member.two_factor, secret_key: '', backup_codes: [] }
-          : undefined,
+        two_factor: { ...member.two_factor, secret_key: '', backup_codes: [] },
       }))
     : scopedMember
       ? [sanitizeMemberForPublicState(scopedMember)]
@@ -4340,7 +4611,14 @@ async function startServer() {
   } catch (err) {
     console.error('[PostgreSQL] Üye dizini yüklenemedi:', err);
   }
+  try {
+    await recoverInterruptedRegistrations();
+  } catch (err) {
+    console.error('[PostgreSQL] Yarım kalan kayıtlar kurtarılamadı:', err);
+  }
   const app = express();
+  // Render tek bir proxy katmanı kullanır; rate limit için gerçek istemci IP'si bu ayarla okunur.
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '50mb' }));
 
   app.post('/api/v1/member/session', (req, res) => {
@@ -5222,6 +5500,7 @@ async function startServer() {
           Number(incoming.fixedCareerBonusAmount ?? existing.fixedCareerBonusAmount ?? 1000)
         );
         const newPkgId = normalizePackageId(incoming.minPackageId) || existing.minPackageId;
+        const newPkgDef = newPkgId ? PACKAGES[newPkgId] : undefined;
         const newUnlockedDepth = Math.max(
           1,
           Math.min(7, Number(incoming.unlockedDepth ?? existing.unlockedDepth))
@@ -5249,8 +5528,8 @@ async function startServer() {
           minPackageId: newPkgId,
           minPackageLabel: incoming.minPackageLabel
             ? String(incoming.minPackageLabel).trim()
-            : PACKAGES[newPkgId].name,
-          minPackageRank: existing.level === 1 ? 0 : PACKAGES[newPkgId].rankOrder,
+            : newPkgDef?.name ?? existing.minPackageLabel,
+          minPackageRank: existing.level === 1 || !newPkgDef ? 0 : newPkgDef.rankOrder,
           minPersonalVolume: newMinVol,
           minActiveDirects: newMinDir,
           minGroupVolume: newMinGroupVol,
@@ -5961,21 +6240,7 @@ async function startServer() {
 
   app.post('/api/v1/members', requireAdminJwt, async (req, res) => {
     try {
-      const {
-        user_id,
-        full_name,
-        email,
-        phone,
-        ref_code,
-        city,
-        country_code,
-        initial_package_id,
-        manual_career_override,
-        skip_initial_order,
-        session_credits,
-        password,
-        assigned_leg,
-      } = req.body;
+      const { full_name, country_code, password } = req.body;
       if (!full_name || String(full_name).trim().length < 2) {
         res.status(400).json({
           status: 'error',
@@ -5996,178 +6261,11 @@ async function startServer() {
         return;
       }
 
-      const result = await runInAtomicTransaction(() => {
-        const normalizedEmail = String(email || '').trim().toLowerCase();
-        if (normalizedEmail && members.some((existing) => existing.email.toLowerCase() === normalizedEmail)) {
-          const error: any = new Error('Bu e-posta adresiyle kayıtlı bir bayi zaten var.');
-          error.statusCode = 409;
-          error.code = 'DUPLICATE_EMAIL';
-          throw error;
-        }
-        const requestedUserId = String(user_id || '').trim();
-        if (requestedUserId && members.some((existing) => existing.user_id === requestedUserId)) {
-          const error: any = new Error('Bu kullanıcı kimliği zaten kayıtlı.');
-          error.statusCode = 409;
-          error.code = 'DUPLICATE_USER_ID';
-          throw error;
-        }
-        const nextLineId = members.length + 1;
-        const randSuffix = Math.random().toString(36).substring(2, 8).toUpperCase();
-        const newUserId = requestedUserId || `USR-${randSuffix}`;
-        const pkgKey =
-          normalizePackageId(initial_package_id || 'PKG_ALTIN_PRO') || 'PKG_ALTIN_PRO';
-        const nowIso = new Date().toISOString();
-        const sponsorMember = members.reduce<MonolineMember | undefined>(
-          (latest, member) =>
-            !latest || member.global_line_id > latest.global_line_id ? member : latest,
-          undefined
-        );
-
-        const customRef = ref_code ? String(ref_code).trim().toUpperCase() : '';
-        const authHdr = req.headers.authorization;
-        const tok = authHdr?.startsWith('Bearer ') ? authHdr.slice('Bearer '.length).trim() : null;
-        const isCallingAdmin = Boolean(tok && verifyAdminToken(tok));
-        const skipInitialOrder = isCallingAdmin && Boolean(skip_initial_order);
-
-        // Client-side trust revocation: only admin can force a career override
-        const manualCareer =
-          isCallingAdmin &&
-          manual_career_override !== undefined &&
-          manual_career_override !== null &&
-          manual_career_override !== ''
-            ? Number(manual_career_override)
-            : null;
-
-        // Session credits: only admin can pass arbitrary credits, otherwise computed server-side from package
-        const effectiveCredits =
-          isCallingAdmin && typeof session_credits === 'number' && session_credits >= 0
-            ? Math.round(session_credits)
-            : skipInitialOrder
-            ? WELCOME_BONUS_TOTAL_CREDITS
-            : (PACKAGES[pkgKey]?.sessionCredits ?? 32);
-
-        let finalLeg: 'LEFT' | 'RIGHT' = 'LEFT';
-        if (assigned_leg === 'LEFT' || assigned_leg === 'RIGHT') {
-          finalLeg = assigned_leg;
-        } else if (sponsorMember) {
-          const leftCount = members.filter(
-            (m) => m.sponsor_id === sponsorMember.user_id && (m as any).assigned_leg === 'LEFT'
-          ).length;
-          const rightCount = members.filter(
-            (m) => m.sponsor_id === sponsorMember.user_id && (m as any).assigned_leg === 'RIGHT'
-          ).length;
-          finalLeg = leftCount <= rightCount ? 'LEFT' : 'RIGHT';
-        }
-
-        const newMember: MonolineMember = {
-          id: nextLineId,
-          user_id: newUserId,
-          global_line_id: nextLineId,
-          ref_code: customRef || `AURA-BAYI-${Math.floor(1000 + Math.random() * 9000)}`,
-          full_name: String(full_name).trim(),
-          email:
-            email && String(email).trim()
-              ? String(email).trim()
-              : `${String(full_name)
-                  .toLowerCase()
-                  .replace(/[^a-z0-9]/g, '.')
-                  .replace(/\.+/g, '.')}@akngroupfrekans.com`,
-          phone: phone ? String(phone).trim() : '',
-          city: String(city || 'Türkiye').trim(),
-          country_code: normalizedCountryCode,
-          joined_at: nowIso,
-          sponsor_id: sponsorMember ? sponsorMember.user_id : null,
-          sponsor_db_id: sponsorMember ? sponsorMember.id : null,
-          highest_package_id: pkgKey,
-          session_credits: effectiveCredits,
-          personal_volume: 0,
-          group_volume: 0,
-          active_direct_referrals: 0,
-          career_level: 1, // Default: 1 (Emmâre)
-          career_title: 'Emmâre',
-          manual_career_override: manualCareer,
-          unlocked_depth: 1,
-          wallets: {
-            sponsor_wallet: 0,
-            monoline_wallet: 0,
-            career_pool_wallet: 0,
-            total_earnings: 0,
-            wallet_domestic_usd: 0,
-            wallet_international_usd: 0,
-
-            system_fund_balance: 0,
-            total_withdrawn: 0,
-          },
-          bank_details: {
-            iban_holder_name: String(full_name).trim(),
-            bank_name: 'Ziraat Bankası',
-            iban: `TR${Math.floor(10 + Math.random() * 89)} 0001 0004 8271 9283 10${nextLineId}`,
-            trc20_address: `T${Math.random()
-              .toString(36)
-              .substring(2, 15)
-              .toUpperCase()}9X2K${nextLineId}`,
-            preferred_method: 'IBAN',
-          },
-          two_factor: generateTwoFactorConfig().config,
-          is_active: true,
-          is_locked: false,
-          activity_expires_at: createFutureExpiryIso(),
-          welcome_bonus_granted: skipInitialOrder,
-          welcome_bonus_credits: skipInitialOrder ? WELCOME_BONUS_TOTAL_CREDITS : 0,
-          tc_identity_no:
-            req.body?.tc_identity_no ||
-            `${Math.floor(10000000000 + Math.random() * 89999999999)}`,
-          has_tax_company: Boolean(req.body?.has_tax_company),
-          last_login_ip:
-            req.body?.last_login_ip || `176.240.${Math.floor(10 + Math.random() * 200)}.${nextLineId}`,
-          device_fingerprint: req.body?.device_fingerprint || `DEV-FP-${nextLineId}`,
-          kvkk_approved_at: nowIso,
-          contract_version: req.body?.contract_version || 'v2.0',
-          daily_withdrawal_limit:
-            DAILY_WITHDRAWAL_LIMITS_BY_CAREER[manualCareer || 1] || 5000,
-          fast_start_awarded: false,
-          assigned_leg: finalLeg,
-          left_leg_volume: 0,
-          right_leg_volume: 0,
-        };
-
-        members.push(newMember);
-
-        if (skipInitialOrder) {
-          creditsOwnedByServer.add(newMember.user_id);
-          logActivityEvent({
-            member: newMember,
-            action_type: 'WELCOME_BONUS_GRANTED',
-            previous_expires_at: newMember.activity_expires_at,
-            new_expires_at: newMember.activity_expires_at,
-            description: `🎁 İlk Bayi Kaydı Hoşgeldin Bonusu: ${newMember.full_name} hesabına bir defaya mahsus 32+32 (Toplam ${WELCOME_BONUS_TOTAL_CREDITS}) Seans Kredisi otomatik tanımlandı.`,
-          });
-        }
-
-        if (skipInitialOrder) {
-          recalculateAllCareers('MANUAL_ADMIN');
-          if (password) {
-            memberCredentials.set(newMember.user_id, hashMemberPassword(String(password)));
-          }
-          return { newMember, tx: null };
-        }
-
-        const orderAmt = getPackageOrderAmount(newUserId, pkgKey);
-
-        const tx = processOrderCommission({
-          user_id: newUserId,
-          order_id: `ORD-KAYIT-${nextLineId}-${Date.now().toString().slice(-4)}`,
-          order_amount: orderAmt,
-          package_id: pkgKey,
-          timestamp: nowIso,
-        });
-        if (password) {
-          memberCredentials.set(newMember.user_id, hashMemberPassword(String(password)));
-        }
-
-        return { newMember, tx };
-      });
-      await persistMemberRegistry();
+      const authHdr = req.headers.authorization;
+      const tok = authHdr?.startsWith('Bearer ') ? authHdr.slice('Bearer '.length).trim() : null;
+      const isCallingAdmin = Boolean(tok && verifyAdminToken(tok));
+      const credentials = password ? hashMemberPassword(String(password)) : null;
+      const result = await commitMemberChange(() => createMemberRecord(req.body, isCallingAdmin, credentials));
 
       res.status(201).json({
         status: 'success',
@@ -9712,6 +9810,291 @@ async function startServer() {
     }
   });
 
+  app.post('/api/v1/registrations', registrationCreateRateLimiter, async (req, res) => {
+    try {
+      const body = req.body || {};
+      const fullName = String(body.full_name || '').trim();
+      const email = String(body.email || '').trim().toLowerCase();
+      const password = String(body.password || '');
+      const countryCode = String(body.country_code || 'TR').trim().toUpperCase();
+      const packageId = normalizePackageId(String(body.initial_package_id || 'PKG_ALTIN_PRO'));
+      if (fullName.length < 2) {
+        res.status(400).json({ status: 'error', code: 'INVALID_FULL_NAME', message: 'Ad soyad zorunludur.' });
+        return;
+      }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        res.status(400).json({ status: 'error', code: 'INVALID_EMAIL', message: 'Geçerli bir e-posta adresi giriniz.' });
+        return;
+      }
+      if (password.length < 8) {
+        res.status(400).json({ status: 'error', code: 'WEAK_MEMBER_PASSWORD', message: 'Üye parolası en az 8 karakter olmalıdır.' });
+        return;
+      }
+      if (!/^[A-Z]{2}$/.test(countryCode)) {
+        res.status(400).json({ status: 'error', code: 'INVALID_COUNTRY_CODE', message: 'Ülke kodu ISO 3166-1 alpha-2 biçiminde olmalıdır.' });
+        return;
+      }
+      if (!packageId) {
+        res.status(400).json({ status: 'error', code: 'INVALID_PACKAGE', message: 'Geçersiz paket seçimi.' });
+        return;
+      }
+      if (members.some((member) => member.email.toLowerCase() === email)) {
+        res.status(409).json({ status: 'error', code: 'DUPLICATE_EMAIL', message: 'Bu e-posta adresiyle kayıtlı bir üye zaten var.' });
+        return;
+      }
+
+      const registrationId = `REG-${randomBytes(8).toString('hex').toUpperCase()}`;
+      const paymentToken = randomBytes(32).toString('hex');
+      const payload = {
+        body: {
+          full_name: fullName,
+          email,
+          phone: body.phone,
+          city: body.city,
+          country_code: countryCode,
+          ref_code: body.ref_code,
+          initial_package_id: packageId,
+          tc_identity_no: body.tc_identity_no,
+          has_tax_company: Boolean(body.has_tax_company),
+          last_login_ip: getRequestIp(req),
+        },
+        credentials: hashMemberPassword(password),
+      };
+      const emailHash = pendingRegistrationEmailHash(email);
+      try {
+        await getPostgresPool().query(
+          `UPDATE pending_member_registrations SET status = 'EXPIRED'
+           WHERE email_hash = $1 AND status = 'PENDING_PAYMENT' AND created_at < NOW() - INTERVAL '24 hours'`,
+          [emailHash]
+        );
+        await getPostgresPool().query(
+          `INSERT INTO pending_member_registrations (registration_id, payment_token_hash, payload_ciphertext, email_hash)
+           VALUES ($1, $2, $3, $4)`,
+          [
+            registrationId,
+            pendingRegistrationTokenHash(paymentToken),
+            encryptAccountingPii(payload, memberRegistryEncryptionKey()),
+            emailHash,
+          ]
+        );
+      } catch (insertError: any) {
+        if (insertError?.code === '23505') {
+          res.status(409).json({ status: 'error', code: 'DUPLICATE_PENDING_EMAIL', message: 'Bu e-posta adresiyle devam eden bir kayıt var.' });
+          return;
+        }
+        throw insertError;
+      }
+
+      res.status(201).json({
+        status: 'success',
+        registration_id: registrationId,
+        registration_status: 'PENDING_PAYMENT',
+        payment_token: paymentToken,
+        payment: {
+          provider: paymentProviderName(),
+          payment_url: null,
+          amount: roundCurrency(getPackagePriceForRegion(PACKAGES[packageId].defaultPrice, resolveMemberRegion(countryCode))),
+        },
+        message: 'Kayıt oluşturuldu. Ödeme onaylanana kadar üye monoline zincirine dahil edilmez.',
+      });
+    } catch (err: any) {
+      res.status(400).json({ status: 'error', message: err?.message || 'Kayıt oluşturulamadı.' });
+    }
+  });
+
+  app.post('/api/v1/registrations/:registrationId/payment', registrationActionRateLimiter, async (req, res) => {
+    if (!sandboxPaymentsEnabled()) {
+      res.status(503).json({ status: 'error', message: 'Sandbox POS üretim ortamında kapalıdır.' });
+      return;
+    }
+    const registrationId = String(req.params.registrationId || '');
+    const merchantOid = `AURA-${Date.now().toString(36).toUpperCase()}-${randomBytes(8).toString('hex').toUpperCase()}`;
+    const completeToken = randomBytes(32).toString('hex');
+    const ip = getRequestIp(req);
+    const card = req.body?.card_details || {};
+    const requestLog = {
+      order_id: registrationId,
+      card_last4: String(card.cardNumber || '').replace(/\D/g, '').slice(-4),
+    };
+
+    try {
+      const row = await loadPendingRegistration(registrationId, String(req.body?.payment_token || ''));
+      if (!row) {
+        res.status(404).json({ status: 'error', code: 'REGISTRATION_NOT_FOUND', message: 'Kayıt bulunamadı.' });
+        return;
+      }
+      if (row.status !== 'PENDING_PAYMENT' || row.is_expired) {
+        res.status(409).json({ status: 'error', code: 'REGISTRATION_NOT_PAYABLE', message: 'Bu kayıt için ödeme başlatılamaz.' });
+        return;
+      }
+      const payload = decryptPendingRegistrationPayload(row.payload_ciphertext);
+      const packageId = payload.body.initial_package_id as Exclude<PackageId, 'CUSTOM'>;
+      const amount = roundCurrency(
+        getPackagePriceForRegion(PACKAGES[packageId].defaultPrice, resolveMemberRegion(payload.body.country_code))
+      );
+      const result = await createPaymentProvider().initiate({
+        merchantOid,
+        orderId: registrationId,
+        userId: registrationId,
+        amount,
+        card,
+      });
+      const rotated = await getPostgresPool().query(
+        `UPDATE pending_member_registrations SET merchant_oid = $2, payment_token_hash = $3
+         WHERE registration_id = $1 AND payment_token_hash = $4 AND status = 'PENDING_PAYMENT'`,
+        [registrationId, result.merchantOid, pendingRegistrationTokenHash(completeToken), row.payment_token_hash]
+      );
+      if (!rotated.rowCount) {
+        res.status(409).json({ status: 'error', code: 'PAYMENT_TOKEN_ALREADY_USED', message: 'Bu ödeme yetkisi daha önce kullanıldı.' });
+        return;
+      }
+      appendPaymentLog({
+        merchant_oid: result.merchantOid,
+        stage: 'INITIATE',
+        provider: result.provider,
+        user_id: registrationId,
+        request: requestLog,
+        response_status: 'SUCCESS',
+        response_code: null,
+        response_message: '3D Secure doğrulaması bekleniyor',
+        ip_address: ip,
+      });
+      res.json({
+        status: 'success',
+        registration_id: registrationId,
+        registration_status: 'PENDING_PAYMENT',
+        complete_token: completeToken,
+        merchant_oid: result.merchantOid,
+        requires_3ds: true,
+        masked_card: result.maskedCard,
+        provider: result.provider,
+      });
+    } catch (err: any) {
+      const code = paymentErrorCode(err);
+      appendPaymentLog({
+        merchant_oid: merchantOid,
+        stage: 'INITIATE',
+        provider: paymentProviderName(),
+        user_id: registrationId,
+        request: requestLog,
+        response_status: 'FAILED',
+        response_code: code,
+        response_message: err?.message || 'Sanal POS başlatılamadı.',
+        ip_address: ip,
+      });
+      res.status(400).json({ status: 'error', error_code: code, message: err?.message || 'Sanal POS başlatılamadı.' });
+    }
+  });
+
+  app.post('/api/v1/registrations/:registrationId/complete', registrationActionRateLimiter, async (req, res) => {
+    if (!sandboxPaymentsEnabled()) {
+      res.status(503).json({ status: 'error', message: 'Sandbox 3DS üretim ortamında kapalıdır.' });
+      return;
+    }
+    const registrationId = String(req.params.registrationId || '');
+
+    try {
+      const row = await loadPendingRegistration(registrationId, String(req.body?.payment_token || ''));
+      if (!row || !row.merchant_oid) {
+        res.status(404).json({ status: 'error', code: 'REGISTRATION_NOT_FOUND', message: 'Kayıt bulunamadı.' });
+        return;
+      }
+      const merchantOid: string = row.merchant_oid;
+      if (row.status !== 'PENDING_PAYMENT' || row.is_expired || finalizedMerchantOids.has(merchantOid)) {
+        res.status(409).json({ status: 'error', code: 'REGISTRATION_NOT_COMPLETABLE', message: 'Bu kayıt tamamlanamaz.' });
+        return;
+      }
+
+      const paymentResult = await createPaymentProvider().complete3ds(
+        merchantOid,
+        String(req.body?.sms_code || ''),
+        registrationId
+      );
+      finalizedMerchantOids.add(merchantOid);
+      appendPaymentLog({
+        merchant_oid: merchantOid,
+        stage: '3DS_CALLBACK',
+        provider: paymentResult.provider,
+        user_id: registrationId,
+        request: { amount: paymentResult.amount, masked_card: paymentResult.maskedCard },
+        response_status: paymentResult.success ? 'SUCCESS' : 'FAILED',
+        response_code: paymentResult.errorCode,
+        response_message: paymentResult.errorMessage || 'İşlem onaylandı',
+        transaction_id: paymentResult.transactionId,
+        ip_address: getRequestIp(req),
+      });
+      if (!paymentResult.success) {
+        res.status(402).json({
+          status: 'error',
+          registration_id: registrationId,
+          error_code: paymentResult.errorCode,
+          message: paymentResult.errorMessage,
+        });
+        return;
+      }
+
+      const claim = await getPostgresPool().query(
+        `UPDATE pending_member_registrations SET status = 'ACTIVATING'
+         WHERE registration_id = $1 AND status = 'PENDING_PAYMENT'
+         RETURNING payload_ciphertext`,
+        [registrationId]
+      );
+      if (!claim.rowCount) {
+        res.status(409).json({ status: 'error', code: 'REGISTRATION_NOT_COMPLETABLE', message: 'Bu kayıt tamamlanamaz.' });
+        return;
+      }
+      const payload = decryptPendingRegistrationPayload(claim.rows[0].payload_ciphertext);
+
+      let activation: { newMember: MonolineMember; tx: CommissionTransaction | null };
+      try {
+        activation = await commitMemberChange(() =>
+          createMemberRecord(payload.body, false, payload.credentials)
+        );
+      } catch (activationError) {
+        await getPostgresPool().query(
+          `UPDATE pending_member_registrations SET status = 'PAID_NEEDS_REVIEW' WHERE registration_id = $1`,
+          [registrationId]
+        );
+        console.error('[Kayıt aktivasyonu] Ödeme alındı ancak üyelik oluşturulamadı:', registrationId, activationError);
+        res.status(409).json({
+          status: 'error',
+          registration_id: registrationId,
+          registration_status: 'PAID_NEEDS_REVIEW',
+          code: 'PAYMENT_RECEIVED_ACTIVATION_FAILED',
+          message: 'Ödemeniz alındı ancak üyelik oluşturulamadı. Kaydınız incelemeye alındı.',
+        });
+        return;
+      }
+
+      await getPostgresPool().query(
+        `UPDATE pending_member_registrations SET status = 'ACTIVE', member_user_id = $2, activated_at = NOW()
+         WHERE registration_id = $1`,
+        [registrationId, activation.newMember.user_id]
+      );
+
+      res.status(201).json({
+        status: 'success',
+        registration_id: registrationId,
+        registration_status: 'ACTIVE',
+        member: {
+          user_id: activation.newMember.user_id,
+          global_line_id: activation.newMember.global_line_id,
+          full_name: activation.newMember.full_name,
+          sponsor_id: activation.newMember.sponsor_id,
+          career_title: activation.newMember.career_title,
+        },
+        commission_applied: Boolean(activation.tx),
+      });
+    } catch (err: any) {
+      res.status(err?.statusCode || 400).json({
+        status: 'error',
+        registration_id: registrationId,
+        error_code: err?.code || 'REGISTRATION_FAILED',
+        message: err?.message || 'Kayıt tamamlanamadı.',
+      });
+    }
+  });
+
   app.get('/api/v1/payments/vpos/logs', requireAdminJwt, (_req, res) => {
     res.json({ status: 'success', logs: paymentLogs.slice(-500) });
   });
@@ -10319,7 +10702,7 @@ async function startServer() {
         return { withdrawal, voucher_number: voucherNumber, net_amount_try: amount };
       });
 
-      if ('error' in settlement) return res.status(settlement.statusCode).json({ error: settlement.error });
+      if ('error' in settlement) return res.status(settlement.statusCode ?? 500).json({ error: settlement.error });
       if ('duplicate' in settlement) return res.json({ success: true, is_duplicate: true, status: 'SETTLED' });
       return res.json({
         success: true,
@@ -10701,7 +11084,7 @@ async function startServer() {
         await client.query(`UPDATE payout_batches SET status = 'REJECTED' WHERE batch_id = $1`, [req.params.batchId]);
         return { success: true, status: 'REJECTED' };
       });
-      if ('error' in result) return res.status(result.statusCode).json({ error: result.error });
+      if ('error' in result) return res.status(result.statusCode ?? 500).json({ error: result.error });
       return res.json(result);
     } catch {
       return res.status(503).json({ error: 'Ödeme taslağı iptal edilemedi.' });
@@ -10736,7 +11119,7 @@ async function startServer() {
         );
         return { success: true, status: 'APPROVED' };
       });
-      if ('error' in result) return res.status(result.statusCode).json({ error: result.error });
+      if ('error' in result) return res.status(result.statusCode ?? 500).json({ error: result.error });
       return res.json(result);
     } catch {
       return res.status(503).json({ error: 'Toplu ödeme onaylanamadı.' });
@@ -10848,7 +11231,7 @@ async function startServer() {
         );
         return { success: true, status: 'SETTLED', paid_count: items.rowCount, bank_reference: bankReference };
       });
-      if ('error' in result) return res.status(result.statusCode).json({ error: result.error });
+      if ('error' in result) return res.status(result.statusCode ?? 500).json({ error: result.error });
       return res.json(result);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Ödeme işlemi tamamlanamadı.';

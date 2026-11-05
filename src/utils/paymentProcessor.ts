@@ -186,6 +186,49 @@ export class PaymentProcessor {
 
 export const defaultPaymentProcessor = new PaymentProcessor();
 
+export async function payPendingRegistration(
+  registration: { registrationId: string; paymentToken: string; amount: number },
+  cardDetails: CreditCardDetails
+): Promise<{ memberUserId: string }> {
+  const registrationPath = `/api/v1/registrations/${encodeURIComponent(registration.registrationId)}`;
+  const start = await postJson(`${registrationPath}/payment`, {
+    payment_token: registration.paymentToken,
+    card_details: cardDetails,
+  });
+  if (!start.ok || start.data.status !== 'success') {
+    throw new Error(start.data.message || 'Ödeme başlatılamadı.');
+  }
+
+  const completeToken: string = start.data.complete_token;
+  const maskedCard: string = start.data.masked_card;
+  let errorMessage: string | undefined;
+
+  for (;;) {
+    const smsCode = await request3dsSmsCode({
+      merchantOid: start.data.merchant_oid,
+      amount: registration.amount,
+      maskedCard,
+      errorMessage,
+    });
+    if (smsCode === null) {
+      throw new Error('3D Secure doğrulaması iptal edildi.');
+    }
+
+    const complete = await postJson(`${registrationPath}/complete`, {
+      payment_token: completeToken,
+      sms_code: smsCode,
+    });
+    if (complete.ok && complete.data.status === 'success') {
+      return { memberUserId: complete.data.member.user_id };
+    }
+    if (complete.data.error_code === '3D-SMS-INVALID') {
+      errorMessage = complete.data.message;
+      continue;
+    }
+    throw new Error(complete.data.message || 'Ödeme doğrulanamadı.');
+  }
+}
+
 export const LEGAL_CONTRACT_TEXTS: Record<
   ContractType,
   { title: string; version: string; summary: string; clauses: string[] }

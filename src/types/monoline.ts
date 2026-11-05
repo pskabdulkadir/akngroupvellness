@@ -417,6 +417,9 @@ export interface CareerTier {
   poolBonusLabel: string;
   fixedCareerBonusAmount?: number; // Yönetici tarafından belirlenen net kariyer bonusu (USD)
   enforceStrictOrganizationRules?: boolean; // Grup cirosu, %50 kuralı ve alt ekip kariyer şartlarının terfide zorunlu kontrolü
+  minPackageId?: Exclude<PackageId, 'CUSTOM'>;
+  minPackageLabel?: string;
+  minPackageRank?: number;
   meaning: string;
 }
 
